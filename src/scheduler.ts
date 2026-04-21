@@ -190,8 +190,6 @@ export class CronScheduler {
         if (delay > 0) {
           const timeout = setTimeout(async () => {
             await this.executeJobIfLeader(job);
-            this.storage.updateJob(job.id, { enabled: false });
-            this.emitChange({ type: "update", job: { ...job, enabled: false } });
           }, delay);
           this.intervals.set(job.id, timeout as any);
         }
@@ -250,20 +248,25 @@ export class CronScheduler {
 
       this.pi.sendUserMessage(job.prompt, { deliverAs: "followUp" });
 
-      const nextRun = this.getNextRun(job.id);
-      this.storage.updateJob(job.id, {
-        lastRun: new Date().toISOString(),
-        lastStatus: "success",
-        runCount: job.runCount + 1,
-        nextRun: nextRun?.toISOString(),
-      });
-
-      this.emitChange({ type: "fire", job });
+      if (job.type === "once") {
+        this.storage.removeJob(job.id);
+        this.emitChange({ type: "remove", jobId: job.id });
+      } else {
+        const nextRun = this.getNextRun(job.id);
+        this.storage.updateJob(job.id, {
+          lastRun: new Date().toISOString(),
+          lastStatus: "success",
+          runCount: job.runCount + 1,
+          nextRun: nextRun?.toISOString(),
+        });
+        this.emitChange({ type: "fire", job });
+      }
     } catch (error) {
       console.error(`Failed to execute job ${job.id}:`, error);
       this.storage.updateJob(job.id, {
         lastRun: new Date().toISOString(),
         lastStatus: "error",
+        ...(job.type === "once" && { enabled: false }),
       });
       this.emitChange({
         type: "error",

@@ -440,3 +440,70 @@ describe("start", () => {
     expect(schedSpy).not.toHaveBeenCalled();
   });
 });
+
+// ─── executeJob: once-job cleanup ────────────────────────────────────────────
+
+describe("executeJob: once-job cleanup", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sched-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("removes a once job from storage after successful execution", async () => {
+    const job = makeJob({ id: "once-job", type: "once", schedule: from(10_000) });
+    const storage = makeStorage(tmpDir, [job]);
+    const pi = makePi();
+    const scheduler = new CronScheduler(storage, pi);
+
+    await (scheduler as any).executeJob(job);
+
+    expect(storage.removeJob).toHaveBeenCalledWith("once-job");
+    expect(storage.updateJob).not.toHaveBeenCalledWith(
+      "once-job",
+      expect.objectContaining({ enabled: false })
+    );
+  });
+
+  it("does NOT remove a recurring cron job after execution", async () => {
+    const job = makeJob({
+      id: "cron-job",
+      type: "cron",
+      schedule: "* * * * * *",
+      createdAt: ago(5_000),
+    });
+    const storage = makeStorage(tmpDir, [job]);
+    const scheduler = new CronScheduler(storage, makePi());
+
+    await (scheduler as any).executeJob(job);
+
+    expect(storage.removeJob).not.toHaveBeenCalled();
+    expect(storage.updateJob).toHaveBeenCalledWith(
+      "cron-job",
+      expect.objectContaining({ lastStatus: "success" })
+    );
+  });
+
+  it("disables (not removes) a once job when execution fails", async () => {
+    const job = makeJob({ id: "once-err", type: "once", schedule: from(10_000) });
+    const storage = makeStorage(tmpDir, [job]);
+    const pi = makePi();
+    // Make sendUserMessage throw
+    (pi.sendUserMessage as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      throw new Error("send failed");
+    });
+    const scheduler = new CronScheduler(storage, pi);
+
+    await (scheduler as any).executeJob(job);
+
+    expect(storage.removeJob).not.toHaveBeenCalled();
+    expect(storage.updateJob).toHaveBeenCalledWith(
+      "once-err",
+      expect.objectContaining({ lastStatus: "error", enabled: false })
+    );
+  });
+});
