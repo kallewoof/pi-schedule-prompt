@@ -1,54 +1,53 @@
+import * as fs from "fs";
+import * as path from "path";
 import { Cron } from "croner";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { CronJob, CronChangeEvent } from "./types.js";
 import type { CronStorage } from "./storage.js";
 
-/**
- * Manages cron job scheduling and execution
- */
 export class CronScheduler {
   private jobs = new Map<string, Cron>();
   private intervals = new Map<string, NodeJS.Timeout>();
   private readonly storage: CronStorage;
   private readonly pi: ExtensionAPI;
+  private readonly leaderPidPath: string;
 
   constructor(storage: CronStorage, pi: ExtensionAPI) {
     this.storage = storage;
     this.pi = pi;
+    this.leaderPidPath = path.join(storage.getPiDir(), "leader.pid");
   }
 
-  /**
-   * Start the scheduler with all enabled jobs
-   */
   start(): void {
     const allJobs = this.storage.getAllJobs();
+    const now = new Date();
+
     for (const job of allJobs) {
-      if (job.enabled) {
+      if (!job.enabled) continue;
+
+      if (this.isMissed(job, now)) {
+        void this.executeJobIfLeader(job);
+        if (job.type !== "once") {
+          this.scheduleJob(job);
+        }
+      } else {
         this.scheduleJob(job);
       }
     }
   }
 
-  /**
-   * Stop all scheduled jobs
-   */
   stop(): void {
-    // Stop all cron jobs
     for (const cron of this.jobs.values()) {
       cron.stop();
     }
     this.jobs.clear();
 
-    // Clear all intervals
     for (const interval of this.intervals.values()) {
       clearInterval(interval);
     }
     this.intervals.clear();
   }
 
-  /**
-   * Add and schedule a new job
-   */
   addJob(job: CronJob): void {
     if (job.enabled) {
       this.scheduleJob(job);
@@ -56,17 +55,11 @@ export class CronScheduler {
     this.emitChange({ type: "add", job });
   }
 
-  /**
-   * Remove and unschedule a job
-   */
   removeJob(id: string): void {
     this.unscheduleJob(id);
     this.emitChange({ type: "remove", jobId: id });
   }
 
-  /**
-   * Update a job (reschedule if needed)
-   */
   updateJob(id: string, updated: CronJob): void {
     this.unscheduleJob(id);
     if (updated.enabled) {
@@ -75,9 +68,6 @@ export class CronScheduler {
     this.emitChange({ type: "update", job: updated });
   }
 
-  /**
-   * Get next run time for a job
-   */
   getNextRun(jobId: string): Date | null {
     const cron = this.jobs.get(jobId);
     if (cron) {
@@ -87,49 +77,116 @@ export class CronScheduler {
     return null;
   }
 
+  // --- Leader election ---
+
+  private readLeaderPid(): number | null {
+    try {
+      const content = fs.readFileSync(this.leaderPidPath, "utf-8").trim();
+      const pid = parseInt(content, 10);
+      return isNaN(pid) ? null : pid;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeLeaderPid(pid: number): void {
+    try {
+      const piDir = this.storage.getPiDir();
+      if (!fs.existsSync(piDir)) {
+        fs.mkdirSync(piDir, { recursive: true });
+      }
+      const tempPath = `${this.leaderPidPath}.tmp`;
+      fs.writeFileSync(tempPath, String(pid), "utf-8");
+      fs.renameSync(tempPath, this.leaderPidPath);
+    } catch (error) {
+      console.error("Failed to write leader.pid:", error);
+    }
+  }
+
+  private isPidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err: any) {
+      // EPERM → process exists but we lack permission to signal it → alive
+      // ESRCH → process does not exist → dead
+      return err.code === "EPERM";
+    }
+  }
+
   /**
-   * Schedule a single job
+   * Attempt to acquire leadership before firing a job.
+   * Returns true if this process should execute the job.
    */
+  private async acquireLeadership(): Promise<boolean> {
+    const ownPid = process.pid;
+
+    const existing = this.readLeaderPid();
+    if (existing !== null && this.isPidAlive(existing)) {
+      return existing === ownPid;
+    }
+
+    // No live leader — try to claim it
+    this.writeLeaderPid(ownPid);
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+
+    // Check if we won the race
+    return this.readLeaderPid() === ownPid;
+  }
+
+  // --- Missed-job detection ---
+
+  private isMissed(job: CronJob, now: Date): boolean {
+    if (job.type === "once") {
+      return new Date(job.schedule) <= now && !job.lastRun;
+    }
+
+    if (job.type === "interval" && job.intervalMs) {
+      const checkFrom = new Date(job.lastRun ?? job.createdAt);
+      return checkFrom.getTime() + job.intervalMs <= now.getTime();
+    }
+
+    if (job.type === "cron") {
+      const checkFrom = new Date(job.lastRun ?? job.createdAt);
+      try {
+        const tempCron = new Cron(job.schedule, { paused: true });
+        const nextAfterLast = tempCron.nextRun(checkFrom);
+        tempCron.stop();
+        return nextAfterLast !== null && nextAfterLast !== undefined && nextAfterLast <= now;
+      } catch {
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  // --- Scheduling ---
+
   private scheduleJob(job: CronJob): void {
     try {
       if (job.type === "interval" && job.intervalMs) {
-        // Interval-based scheduling
         const interval = setInterval(() => {
-          this.executeJob(job);
+          void this.executeJobIfLeader(job);
         }, job.intervalMs);
         this.intervals.set(job.id, interval);
       } else if (job.type === "once") {
-        // One-shot execution at a specific time
         const targetDate = new Date(job.schedule);
-        const now = new Date();
-        const delay = targetDate.getTime() - now.getTime();
+        const delay = targetDate.getTime() - Date.now();
 
         if (delay > 0) {
-          const timeout = setTimeout(() => {
-            this.executeJob(job);
-            // Auto-disable one-shot jobs after execution
+          const timeout = setTimeout(async () => {
+            await this.executeJobIfLeader(job);
             this.storage.updateJob(job.id, { enabled: false });
             this.emitChange({ type: "update", job: { ...job, enabled: false } });
           }, delay);
-          // Store as interval for cleanup purposes
           this.intervals.set(job.id, timeout as any);
-        } else {
-          // Job is in the past - disable it and log warning
-          console.warn(`Job ${job.id} (${job.name}) scheduled for past time: ${job.schedule}`);
-          this.storage.updateJob(job.id, { 
-            enabled: false,
-            lastStatus: "error" 
-          });
-          this.emitChange({ 
-            type: "error", 
-            jobId: job.id, 
-            error: `Scheduled time ${job.schedule} is in the past` 
-          });
         }
+        // Past-time once jobs are handled by isMissed() in start(); nothing to do here.
       } else {
-        // Standard cron expression
         const cron = new Cron(job.schedule, () => {
-          this.executeJob(job);
+          void this.executeJobIfLeader(job);
         });
         this.jobs.set(job.id, cron);
       }
@@ -143,9 +200,6 @@ export class CronScheduler {
     }
   }
 
-  /**
-   * Unschedule a job
-   */
   private unscheduleJob(id: string): void {
     const cron = this.jobs.get(id);
     if (cron) {
@@ -160,33 +214,30 @@ export class CronScheduler {
     }
   }
 
-  /**
-   * Execute a job's prompt
-   */
+  // --- Execution ---
+
+  private async executeJobIfLeader(job: CronJob): Promise<void> {
+    const isLeader = await this.acquireLeadership();
+    if (!isLeader) return;
+    await this.executeJob(job);
+  }
+
   private async executeJob(job: CronJob): Promise<void> {
     console.log(`Executing scheduled prompt: ${job.name} (${job.id})`);
 
     try {
-      // Update status to running
-      this.storage.updateJob(job.id, {
-        lastStatus: "running",
-      });
+      this.storage.updateJob(job.id, { lastStatus: "running" });
       this.emitChange({ type: "fire", job });
 
-      // Send a visible marker message for the scheduled prompt
-      this.pi.sendMessage(
-        {
-          customType: "scheduled_prompt",
-          content: [{ type: "text", text: job.prompt }],
-          display: true,
-          details: { jobId: job.id, jobName: job.name, prompt: job.prompt },
-        }
-      );
+      this.pi.sendMessage({
+        customType: "scheduled_prompt",
+        content: [{ type: "text", text: job.prompt }],
+        display: true,
+        details: { jobId: job.id, jobName: job.name, prompt: job.prompt },
+      });
 
-      // Then send the actual prompt to the agent
       this.pi.sendUserMessage(job.prompt, { deliverAs: "followUp" });
 
-      // Update job execution stats
       const nextRun = this.getNextRun(job.id);
       this.storage.updateJob(job.id, {
         lastRun: new Date().toISOString(),
@@ -210,18 +261,13 @@ export class CronScheduler {
     }
   }
 
-  /**
-   * Emit a change event via pi.events
-   */
   private emitChange(event: CronChangeEvent): void {
     this.pi.events.emit("cron:change", event);
   }
 
-  /**
-   * Validate a cron expression (must be 6-field format with seconds)
-   */
+  // --- Static helpers ---
+
   static validateCronExpression(expression: string): { valid: boolean; error?: string } {
-    // Count fields - must be 6 (second minute hour dom month dow)
     const fields = expression.trim().split(/\s+/);
     if (fields.length !== 6) {
       return {
@@ -231,7 +277,6 @@ export class CronScheduler {
     }
 
     try {
-      // Try parsing as cron expression
       new Cron(expression, () => {});
       return { valid: true };
     } catch (error) {
@@ -242,17 +287,13 @@ export class CronScheduler {
     }
   }
 
-  /**
-   * Parse relative time delta (e.g., "+10s", "+5m", "+1h")
-   * Returns ISO timestamp if valid, null otherwise
-   */
   static parseRelativeTime(delta: string): string | null {
     const match = delta.match(/^\+(\d+)(s|m|h|d)$/);
     if (!match) return null;
 
     const value = parseInt(match[1], 10);
     const unit = match[2];
-    
+
     const msMap: Record<string, number> = {
       s: 1000,
       m: 60 * 1000,
@@ -260,14 +301,9 @@ export class CronScheduler {
       d: 24 * 60 * 60 * 1000,
     };
 
-    const ms = value * msMap[unit];
-    const futureTime = new Date(Date.now() + ms);
-    return futureTime.toISOString();
+    return new Date(Date.now() + value * msMap[unit]).toISOString();
   }
 
-  /**
-   * Parse interval string to milliseconds
-   */
   static parseInterval(interval: string): number | null {
     const match = interval.match(/^(\d+)(s|m|h|d)$/);
     if (!match) return null;
