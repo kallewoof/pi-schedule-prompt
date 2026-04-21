@@ -17,7 +17,7 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup.",
+      "Schedule prompts at times/intervals. For action='add', provide schedule+prompt and optionally jobType ('cron'=recurring default, 'once'=single-shot, 'interval'=repeating). Schedule formats: 6-field cron ('0 * * * * *'=every minute), ISO timestamp, relative time (+10s,+5m,+1h), or interval (5m,1h). Actions: add(needs schedule+prompt), list, remove/enable/disable/update(need jobId), cleanup.",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -67,7 +67,7 @@ export function createCronTool(
               );
             }
 
-            const type = (params.type || "cron") as CronJobType;
+            const type = (params.jobType || "cron") as CronJobType;
             let intervalMs: number | undefined;
             let schedule = params.schedule;
 
@@ -128,7 +128,7 @@ export function createCronTool(
               intervalMs,
               createdAt: now,
               runCount: 0,
-              description: params.description,
+              description: params.jobDescription,
               guaranteed: params.guaranteed ?? false,
             };
 
@@ -258,13 +258,20 @@ export function createCronTool(
             const updates: Partial<CronJob> = {};
             if (params.name) updates.name = params.name;
             if (params.prompt) updates.prompt = params.prompt;
-            if (params.description !== undefined) updates.description = params.description;
+            if (params.jobDescription !== undefined) updates.description = params.jobDescription;
             if (params.guaranteed !== undefined) updates.guaranteed = params.guaranteed;
+            if (params.jobType) updates.type = params.jobType as CronJobType;
+
+            // Use the new type if being changed, otherwise keep existing
+            const effectiveType = (updates.type ?? job.type) as CronJobType;
+
+            // Clear intervalMs when switching away from interval
+            if (updates.type && updates.type !== "interval" && job.type === "interval") {
+              updates.intervalMs = undefined;
+            }
 
             if (params.schedule) {
-              // Validate new schedule
-              const type = job.type;
-              if (type === "interval") {
+              if (effectiveType === "interval") {
                 const parsed = CronScheduler.parseInterval(params.schedule);
                 const intervalMs = parsed !== null ? parsed : undefined;
                 if (!intervalMs) {
@@ -272,12 +279,17 @@ export function createCronTool(
                 }
                 updates.schedule = params.schedule;
                 updates.intervalMs = intervalMs;
-              } else if (type === "once") {
-                const date = new Date(params.schedule);
-                if (isNaN(date.getTime())) {
-                  throw new Error(`Invalid timestamp: ${params.schedule}`);
+              } else if (effectiveType === "once") {
+                const relativeTime = CronScheduler.parseRelativeTime(params.schedule);
+                if (relativeTime) {
+                  updates.schedule = relativeTime;
+                } else {
+                  const date = new Date(params.schedule);
+                  if (isNaN(date.getTime())) {
+                    throw new Error(`Invalid timestamp: ${params.schedule}`);
+                  }
+                  updates.schedule = date.toISOString();
                 }
-                updates.schedule = date.toISOString();
               } else {
                 const validation = CronScheduler.validateCronExpression(params.schedule);
                 if (!validation.valid) {
@@ -325,7 +337,7 @@ export function createCronTool(
               const lastStr = job.lastRun ? `Last: ${job.lastRun}` : "Never run";
 
               lines.push(`${status} ${job.name} (${job.id})`);
-              lines.push(`  Type: ${job.type} | Schedule: ${job.schedule} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
+              lines.push(`  Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Schedule: ${job.schedule} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
               lines.push(`  Prompt: ${job.prompt}`);
               lines.push(`  ${lastStr} ${nextStr ? `| ${nextStr}` : ""}`);
               lines.push(`  Runs: ${job.runCount} | Status: ${job.lastStatus || "pending"}`);
@@ -413,9 +425,10 @@ export function createCronTool(
         for (const job of details.jobs) {
           const status = job.enabled ? theme.fg("success", "✓") : theme.fg("muted", "✗");
           lines.push(`${status} ${theme.fg("text", job.name)} ${theme.fg("dim", `(${job.id})`)}`);
-          const guaranteedStr = job.guaranteed ? theme.fg("warning", "⚡ guaranteed") : theme.fg("dim", "not guaranteed");
+          const recurringStr = job.type !== "once" ? theme.fg("success", "yes") : theme.fg("dim", "no");
+          const guaranteedStr = job.guaranteed ? theme.fg("warning", "⚡ yes") : theme.fg("dim", "no");
           lines.push(
-            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Schedule:")} ${job.schedule} ${theme.fg("dim", "|")} ${guaranteedStr}`
+            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Recurring:")} ${recurringStr} ${theme.fg("dim", "| Schedule:")} ${job.schedule} ${theme.fg("dim", "| Guaranteed:")} ${guaranteedStr}`
           );
           lines.push(`  ${theme.fg("dim", "Prompt:")} ${job.prompt}`);
           if (job.lastRun) {

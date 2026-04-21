@@ -94,14 +94,14 @@ export const CronToolParams = Type.Object({
       description: "Job ID for remove, enable, disable, or update actions",
     })
   ),
-  type: Type.Optional(
+  jobType: Type.Optional(
     StringEnum(["cron", "once", "interval"], {
-      description: "Job type. Use 'once' for relative times like '+10s'. Default is cron",
+      description: "Job type: 'cron' (recurring, default), 'once' (single ISO timestamp or relative time like +10s), 'interval' (repeating, e.g. 5m)",
     })
   ),
-  description: Type.Optional(
+  jobDescription: Type.Optional(
     Type.String({
-      description: "Optional job description",
+      description: "Optional human-readable description of what this job does",
     })
   ),
   guaranteed: Type.Optional(
