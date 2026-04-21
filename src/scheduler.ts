@@ -7,12 +7,31 @@ import type { CronStorage } from "./storage.js";
 
 const GUARANTEED_RETRY_DELAY_MS = 10 * 60 * 1000;
 
+type DeferredAction = { type: "send"; job: CronJob } | { type: "retry"; jobId: string };
+
 export class CronScheduler {
   private jobs = new Map<string, Cron>();
   private intervals = new Map<string, NodeJS.Timeout>();
   private retries = new Map<string, NodeJS.Timeout>();
   /** Job IDs for guaranteed once-jobs that have been sent but not yet confirmed by agent_end. FIFO. */
   private pendingGuaranteedOnce: string[] = [];
+  /**
+   * True while a guaranteed retry is in-flight (retryLastTurn() called, waiting for agent_end).
+   * Blocks new job sends so context tail stays predictable for retryLastTurn().
+   */
+  private retrying = false;
+  private retryingJobId: string | null = null;
+  /** Jobs and retries deferred while retrying=true. Processed FIFO after retry resolves. */
+  private deferredActions: DeferredAction[] = [];
+  /**
+   * True between sendUserMessage and the corresponding agent_end notification.
+   * Set synchronously (before any await) in executeJobIfLeader to prevent concurrent sends
+   * racing through the gate before the first one registers its in-flight state.
+   */
+  private sending = false;
+  /** Tracks which job's prompt is at the tail of the agent context (last sendUserMessage). */
+  private contextTailJobId: string | null = null;
+
   private readonly storage: CronStorage;
   private readonly pi: ExtensionAPI;
   private readonly leaderPidPath: string;
@@ -69,6 +88,11 @@ export class CronScheduler {
     }
     this.retries.clear();
     this.pendingGuaranteedOnce = [];
+    this.retrying = false;
+    this.retryingJobId = null;
+    this.deferredActions = [];
+    this.sending = false;
+    this.contextTailJobId = null;
   }
 
   addJob(job: CronJob): void {
@@ -102,41 +126,62 @@ export class CronScheduler {
 
   /**
    * Called by the host when an agent turn ends.
-   * Resolves the oldest pending guaranteed once-job: removes it on success,
-   * or schedules a 10-minute retry on model error.
+   * Resolves the current retry or the oldest pending guaranteed once-job.
    */
   notifyAgentEnd(messages: readonly unknown[]): void {
+    // Clear the in-flight flag — we're between turns now.
+    this.sending = false;
+
+    // If a retryLastTurn()-based retry is in-flight, this agent_end confirms or re-fails it.
+    if (this.retrying && this.retryingJobId) {
+      const jobId = this.retryingJobId;
+      this.retrying = false;
+      this.retryingJobId = null;
+
+      const job = this.storage.getJob(jobId);
+      if (job && job.enabled && job.guaranteed) {
+        const modelFailed = this.agentEndHasError(messages);
+
+        if (!modelFailed) {
+          this.storage.removeJob(jobId);
+          this.emitChange({ type: "remove", jobId });
+        } else {
+          this.storage.updateJob(jobId, { lastStatus: "error" });
+          this.emitChange({ type: "error", jobId, error: "Model error (retrying in 10m)" });
+          this.scheduleRetryTimer(jobId);
+        }
+      }
+
+      this.processNextDeferred();
+      return;
+    }
+
+    // First-time send: confirm or retry the oldest pending guaranteed once-job.
     const jobId = this.pendingGuaranteedOnce.shift();
-    if (!jobId) return;
+    if (!jobId) {
+      this.processNextDeferred();
+      return;
+    }
 
     const job = this.storage.getJob(jobId);
-    if (!job || !job.enabled || !job.guaranteed) return;
+    if (!job || !job.enabled || !job.guaranteed) {
+      this.processNextDeferred();
+      return;
+    }
 
-    const modelFailed = messages.some(
-      (m) =>
-        typeof m === "object" &&
-        m !== null &&
-        (m as Record<string, unknown>)["role"] === "assistant" &&
-        (m as Record<string, unknown>)["stopReason"] === "error"
-    );
+    const modelFailed = this.agentEndHasError(messages);
 
     if (!modelFailed) {
       this.storage.removeJob(jobId);
       this.emitChange({ type: "remove", jobId });
+      this.processNextDeferred();
       return;
     }
 
     this.storage.updateJob(jobId, { lastStatus: "error" });
     this.emitChange({ type: "error", jobId, error: "Model error (retrying in 10m)" });
-
-    const retry = setTimeout(() => {
-      this.retries.delete(jobId);
-      const current = this.storage.getJob(jobId);
-      if (current && current.enabled && current.guaranteed) {
-        void this.executeJobIfLeader(current);
-      }
-    }, GUARANTEED_RETRY_DELAY_MS);
-    this.retries.set(jobId, retry);
+    this.scheduleRetryTimer(jobId);
+    this.processNextDeferred();
   }
 
   // --- Leader election ---
@@ -286,19 +331,46 @@ export class CronScheduler {
     if (pendingIdx !== -1) {
       this.pendingGuaranteedOnce.splice(pendingIdx, 1);
     }
+
+    this.deferredActions = this.deferredActions.filter(
+      (a) => (a.type === "send" ? a.job.id : a.jobId) !== id
+    );
+
+    // If we were retrying this job, unblock so other deferred actions can proceed.
+    if (this.retryingJobId === id) {
+      this.retrying = false;
+      this.retryingJobId = null;
+      this.processNextDeferred();
+    }
   }
 
   // --- Execution ---
 
   private async executeJobIfLeader(job: CronJob): Promise<void> {
+    if (this.retrying || this.sending) {
+      // Block new sends while a send or retry is in-flight; queue for after it resolves.
+      if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
+        this.deferredActions.push({ type: "send", job });
+      }
+      return;
+    }
+    // Claim the in-flight slot synchronously before the first await so that
+    // other executeJobIfLeader calls queued in the same event-loop turn (e.g.
+    // multiple missed jobs firing at startup) see sending=true and defer.
+    this.sending = true;
     const isLeader = await this.acquireLeadership();
-    if (!isLeader) return;
+    if (!isLeader) {
+      this.sending = false;
+      this.processNextDeferred();
+      return;
+    }
     await this.executeJob(job);
   }
 
   private async executeJob(job: CronJob): Promise<void> {
     console.log(`Executing scheduled prompt: ${job.name} (${job.id})`);
 
+    let sendCompleted = false;
     try {
       this.storage.updateJob(job.id, { lastStatus: "running" });
       this.emitChange({ type: "fire", job });
@@ -311,6 +383,12 @@ export class CronScheduler {
       });
 
       this.pi.sendUserMessage(job.prompt, { deliverAs: "followUp" });
+      // Both send calls succeeded — an agent turn is now in flight.
+      // sending will be cleared by notifyAgentEnd when the turn completes.
+      sendCompleted = true;
+
+      // Track which job's message is now at the tail of context.
+      this.contextTailJobId = job.id;
 
       if (job.type === "once" && job.guaranteed) {
         // Keep in storage — wait for agent_end to confirm delivery before removing.
@@ -332,6 +410,13 @@ export class CronScheduler {
     } catch (error) {
       console.error(`Failed to execute job ${job.id}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
+
+      if (!sendCompleted) {
+        // The send itself threw — no agent turn was started, so notifyAgentEnd
+        // will never arrive to clear this flag. Unblock the deferred queue now.
+        this.sending = false;
+        this.processNextDeferred();
+      }
 
       if (job.guaranteed) {
         this.storage.updateJob(job.id, {
@@ -357,6 +442,97 @@ export class CronScheduler {
         this.emitChange({ type: "error", jobId: job.id, error: errMsg });
       }
     }
+  }
+
+  /**
+   * Schedule a 10-minute retry timer for a guaranteed job.
+   * When the timer fires, calls triggerRetry() unless another retry is in-flight,
+   * in which case the job is deferred until the active retry resolves.
+   */
+  private scheduleRetryTimer(jobId: string): void {
+    const retry = setTimeout(() => {
+      this.retries.delete(jobId);
+      if (this.retrying) {
+        const current = this.storage.getJob(jobId);
+        if (current && current.enabled && current.guaranteed) {
+          if (!this.deferredActions.some((a) => a.type === "retry" && a.jobId === jobId)) {
+            this.deferredActions.push({ type: "retry", jobId });
+          }
+        }
+        return;
+      }
+      this.triggerRetry(jobId);
+    }, GUARANTEED_RETRY_DELAY_MS);
+    this.retries.set(jobId, retry);
+  }
+
+  /**
+   * Initiate a retry for a guaranteed once-job.
+   * Uses retryLastTurn() when the context tail still belongs to this job (clean retry,
+   * no duplicate user message), otherwise falls back to a fresh sendUserMessage.
+   */
+  private triggerRetry(jobId: string): void {
+    const current = this.storage.getJob(jobId);
+    if (!current || !current.enabled || !current.guaranteed) return;
+
+    this.retrying = true;
+    this.retryingJobId = jobId;
+
+    if (this.contextTailJobId === jobId) {
+      // Context ends with this job's error message — use retryLastTurn for a clean replay.
+      try {
+        this.pi.retryLastTurn();
+      } catch (error) {
+        // retryLastTurn() threw (e.g. context changed unexpectedly) — reset and retry later.
+        this.retrying = false;
+        this.retryingJobId = null;
+        console.error(`retryLastTurn failed for job ${jobId}:`, error);
+        this.storage.updateJob(jobId, { lastStatus: "error" });
+        this.scheduleRetryTimer(jobId);
+      }
+    } else {
+      // Context has changed since the failure (another job fired in between).
+      // Re-send as a new user message; it will appear twice in context but at least runs.
+      try {
+        this.pi.sendMessage({
+          customType: "scheduled_prompt",
+          content: [{ type: "text", text: current.prompt }],
+          display: true,
+          details: { jobId: current.id, jobName: current.name, prompt: current.prompt },
+        });
+        this.pi.sendUserMessage(current.prompt, { deliverAs: "followUp" });
+        this.contextTailJobId = jobId;
+      } catch (error) {
+        this.retrying = false;
+        this.retryingJobId = null;
+        const errMsg = error instanceof Error ? error.message : String(error);
+        console.error(`Failed to re-send job ${jobId}:`, error);
+        this.storage.updateJob(jobId, { lastStatus: "error" });
+        this.emitChange({ type: "error", jobId, error: `${errMsg} (retrying in 10m)` });
+        this.scheduleRetryTimer(jobId);
+      }
+    }
+  }
+
+  private processNextDeferred(): void {
+    const action = this.deferredActions.shift();
+    if (!action) return;
+
+    if (action.type === "send") {
+      void this.executeJobIfLeader(action.job);
+    } else {
+      this.triggerRetry(action.jobId);
+    }
+  }
+
+  private agentEndHasError(messages: readonly unknown[]): boolean {
+    return messages.some(
+      (m) =>
+        typeof m === "object" &&
+        m !== null &&
+        (m as Record<string, unknown>)["role"] === "assistant" &&
+        (m as Record<string, unknown>)["stopReason"] === "error"
+    );
   }
 
   private emitChange(event: CronChangeEvent): void {

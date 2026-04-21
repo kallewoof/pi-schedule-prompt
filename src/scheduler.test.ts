@@ -41,6 +41,7 @@ function makeMockPi() {
   return {
     sendMessage: vi.fn(),
     sendUserMessage: vi.fn(),
+    retryLastTurn: vi.fn(),
     events: { emit: vi.fn() },
   };
 }
@@ -256,8 +257,10 @@ describe("guaranteed once-job retry via notifyAgentEnd (model failure path)", ()
     expect(storage.removeJob).not.toHaveBeenCalled();
     expect(storage.updateJob).toHaveBeenCalledWith(job.id, { lastStatus: "error" });
 
+    // Timer fires → retryLastTurn() is used (no duplicate user message)
     await vi.advanceTimersByTimeAsync(RETRY_MS);
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(pi.retryLastTurn).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1); // only the original send
   });
 
   it("retries again if the second attempt also fails", async () => {
@@ -270,13 +273,18 @@ describe("guaranteed once-job retry via notifyAgentEnd (model failure path)", ()
 
     const errorMessages = [{ role: "assistant", stopReason: "error" }];
 
+    // First failure → 10m timer → retryLastTurn
     scheduler.notifyAgentEnd(errorMessages);
     await vi.advanceTimersByTimeAsync(RETRY_MS);
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(pi.retryLastTurn).toHaveBeenCalledTimes(1);
 
+    // Second failure → another 10m timer → retryLastTurn again
     scheduler.notifyAgentEnd(errorMessages);
     await vi.advanceTimersByTimeAsync(RETRY_MS);
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
+    expect(pi.retryLastTurn).toHaveBeenCalledTimes(2);
+
+    // sendUserMessage only called once (the original send)
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
   it("does nothing when there are no pending guaranteed once-jobs", () => {
@@ -315,6 +323,7 @@ describe("guaranteed once-job retry via notifyAgentEnd (model failure path)", ()
     await vi.advanceTimersByTimeAsync(RETRY_MS);
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.retryLastTurn).not.toHaveBeenCalled();
   });
 
   it("stop() clears the pending queue so agent_end after stop is a no-op", async () => {
@@ -331,7 +340,165 @@ describe("guaranteed once-job retry via notifyAgentEnd (model failure path)", ()
     await vi.advanceTimersByTimeAsync(RETRY_MS);
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.retryLastTurn).not.toHaveBeenCalled();
     expect(storage.removeJob).not.toHaveBeenCalled();
+  });
+});
+
+// ---- retrying flag / deferred queue tests ----
+
+describe("retrying flag serialises concurrent guaranteed job retries", () => {
+  it("defers a new job send while retryLastTurn retry is in-flight", async () => {
+    const jobA = makeJob({ id: "job-a", guaranteed: true, prompt: "task A" });
+    const jobB = makeJob({ id: "job-b", name: "Job B", guaranteed: true, prompt: "task B" });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+
+    // Fire A → succeeds → pending agent_end
+    await executeJob(scheduler, jobA);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // Model fails for A → 10m retry scheduled
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "error" }]);
+
+    // A's retry timer fires → retryLastTurn() called, retrying=true
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    expect(pi.retryLastTurn).toHaveBeenCalledTimes(1);
+
+    // B's scheduled time fires while A's retry is in-flight → deferred
+    await executeJob(scheduler, jobB);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1); // B not sent yet
+
+    // A's retry succeeds → retrying=false → B is dequeued and sent
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    // Let the async microtasks flush (acquireLeadership is mocked as a resolved promise)
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2); // B now sent
+  });
+
+  it("deferred retry timer fires when another retry finishes", async () => {
+    const jobA = makeJob({ id: "job-a", guaranteed: true, prompt: "task A" });
+    const jobB = makeJob({ id: "job-b", name: "Job B", guaranteed: true, prompt: "task B" });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+
+    // Fire A and B, both fail → both get 10m retry timers
+    await executeJob(scheduler, jobA);
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "error" }]);
+
+    await executeJob(scheduler, jobB);
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "error" }]);
+
+    // A's retry fires first → retrying=true
+    // (Both timers will fire in the same advanceTimersByTimeAsync, but A was registered first)
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+
+    // At least one retryLastTurn/sendUserMessage retry was triggered
+    const retryCalls = pi.retryLastTurn.mock.calls.length + pi.sendUserMessage.mock.calls.length - 2;
+    expect(retryCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("stop() resets retrying state and clears deferred queue", async () => {
+    const jobA = makeJob({ id: "job-a", guaranteed: true });
+    const jobB = makeJob({ id: "job-b", name: "Job B", guaranteed: true });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+
+    await executeJob(scheduler, jobA);
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "error" }]);
+    await vi.advanceTimersByTimeAsync(RETRY_MS); // A's retry fires, retrying=true
+
+    await executeJob(scheduler, jobB); // B deferred
+
+    scheduler.stop();
+
+    // After stop, notifyAgentEnd is a no-op and no deferred sends happen
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1); // only A's original send
+  });
+
+  it("unscheduleJob() while retrying unblocks deferred queue", async () => {
+    const jobA = makeJob({ id: "job-a", guaranteed: true });
+    const jobB = makeJob({ id: "job-b", name: "Job B", guaranteed: true, prompt: "task B" });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+
+    await executeJob(scheduler, jobA);
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "error" }]);
+    await vi.advanceTimersByTimeAsync(RETRY_MS); // A retrying
+
+    await executeJob(scheduler, jobB); // B deferred
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // Removing A while it is being retried should unblock B
+    (scheduler as any).unscheduleJob(jobA.id);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2); // B now sent
+  });
+});
+
+// ---- concurrent startup sends ----
+
+describe("sending flag serialises concurrent sends at startup", () => {
+  it("defers jobs fired concurrently while one is already in-flight", async () => {
+    const jobA = makeJob({ id: "job-a", guaranteed: true, prompt: "task A" });
+    const jobB = makeJob({ id: "job-b", name: "Job B", guaranteed: true, prompt: "task B" });
+    const jobC = makeJob({ id: "job-c", name: "Job C", guaranteed: true, prompt: "task C" });
+    const storage = makeMockStorage([jobA, jobB, jobC]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+
+    // Simulate three missed jobs firing concurrently (as start() does):
+    // kick off all three without awaiting, then flush microtasks.
+    const p1 = (scheduler as any).executeJobIfLeader(jobA);
+    const p2 = (scheduler as any).executeJobIfLeader(jobB);
+    const p3 = (scheduler as any).executeJobIfLeader(jobC);
+    await Promise.all([p1, p2, p3]);
+
+    // Only the first job should have been sent; B and C are deferred.
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledWith("task A", expect.anything());
+
+    // agent_end for A → B fires
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendUserMessage).toHaveBeenLastCalledWith("task B", expect.anything());
+
+    // agent_end for B → C fires
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
+    expect(pi.sendUserMessage).toHaveBeenLastCalledWith("task C", expect.anything());
+  });
+
+  it("defers a job that fires while a non-guaranteed send is in-flight", async () => {
+    const jobA = makeJob({ id: "job-a", guaranteed: false, prompt: "task A" });
+    const jobB = makeJob({ id: "job-b", name: "Job B", guaranteed: true, prompt: "task B" });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+
+    const p1 = (scheduler as any).executeJobIfLeader(jobA);
+    const p2 = (scheduler as any).executeJobIfLeader(jobB);
+    await Promise.all([p1, p2]);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 });
 
