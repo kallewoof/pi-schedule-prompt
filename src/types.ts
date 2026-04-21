@@ -42,6 +42,8 @@ export interface CronJob {
   runCount: number;
   /** Optional description */
   description?: string;
+  /** If true, run missed jobs immediately on startup; if false (default), drop missed recurring or mark missed one-time as failed */
+  guaranteed?: boolean;
 }
 
 /**
@@ -100,6 +102,12 @@ export const CronToolParams = Type.Object({
   description: Type.Optional(
     Type.String({
       description: "Optional job description",
+    })
+  ),
+  guaranteed: Type.Optional(
+    Type.Boolean({
+      description:
+        "If true, run missed jobs immediately on startup. If false (default), silently drop missed recurring jobs or mark missed one-time jobs as failed.",
     })
   ),
 });

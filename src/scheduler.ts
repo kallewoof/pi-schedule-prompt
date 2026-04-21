@@ -26,8 +26,20 @@ export class CronScheduler {
       if (!job.enabled) continue;
 
       if (this.isMissed(job, now)) {
-        void this.executeJobIfLeader(job);
-        if (job.type !== "once") {
+        if (job.guaranteed) {
+          void this.executeJobIfLeader(job);
+          if (job.type !== "once") {
+            this.scheduleJob(job);
+          }
+        } else if (job.type === "once") {
+          this.storage.updateJob(job.id, {
+            enabled: false,
+            lastStatus: "error",
+            lastRun: now.toISOString(),
+          });
+          this.emitChange({ type: "error", jobId: job.id, error: "Missed one-time job (not guaranteed)" });
+        } else {
+          // Recurring job: silently drop the missed execution, resume normal schedule
           this.scheduleJob(job);
         }
       } else {

@@ -129,6 +129,7 @@ export function createCronTool(
               createdAt: now,
               runCount: 0,
               description: params.description,
+              guaranteed: params.guaranteed ?? false,
             };
 
             storage.addJob(job);
@@ -258,6 +259,7 @@ export function createCronTool(
             if (params.name) updates.name = params.name;
             if (params.prompt) updates.prompt = params.prompt;
             if (params.description !== undefined) updates.description = params.description;
+            if (params.guaranteed !== undefined) updates.guaranteed = params.guaranteed;
 
             if (params.schedule) {
               // Validate new schedule
@@ -323,7 +325,7 @@ export function createCronTool(
               const lastStr = job.lastRun ? `Last: ${job.lastRun}` : "Never run";
 
               lines.push(`${status} ${job.name} (${job.id})`);
-              lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
+              lines.push(`  Type: ${job.type} | Schedule: ${job.schedule} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
               lines.push(`  Prompt: ${job.prompt}`);
               lines.push(`  ${lastStr} ${nextStr ? `| ${nextStr}` : ""}`);
               lines.push(`  Runs: ${job.runCount} | Status: ${job.lastStatus || "pending"}`);
@@ -411,8 +413,9 @@ export function createCronTool(
         for (const job of details.jobs) {
           const status = job.enabled ? theme.fg("success", "✓") : theme.fg("muted", "✗");
           lines.push(`${status} ${theme.fg("text", job.name)} ${theme.fg("dim", `(${job.id})`)}`);
+          const guaranteedStr = job.guaranteed ? theme.fg("warning", "⚡ guaranteed") : theme.fg("dim", "not guaranteed");
           lines.push(
-            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Schedule:")} ${job.schedule}`
+            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Schedule:")} ${job.schedule} ${theme.fg("dim", "|")} ${guaranteedStr}`
           );
           lines.push(`  ${theme.fg("dim", "Prompt:")} ${job.prompt}`);
           if (job.lastRun) {

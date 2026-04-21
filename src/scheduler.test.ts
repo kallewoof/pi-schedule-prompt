@@ -235,11 +235,14 @@ describe("start", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("missed once job: executes it and does NOT schedule it", () => {
+  // ── guaranteed: true ────────────────────────────────────────────────────────
+
+  it("guaranteed once job: executes it and does NOT schedule it", () => {
     const job = makeJob({
       id: "missed-once",
       type: "once",
       schedule: ago(60_000),
+      guaranteed: true,
     });
     const scheduler = new CronScheduler(makeStorage(tmpDir, [job]), makePi());
     const execSpy = vi
@@ -255,12 +258,13 @@ describe("start", () => {
     expect(schedSpy).not.toHaveBeenCalled();
   });
 
-  it("missed cron job: executes it AND schedules it for future firings", () => {
+  it("guaranteed cron job: executes it AND schedules it for future firings", () => {
     const job = makeJob({
       id: "missed-cron",
       type: "cron",
       schedule: "* * * * * *",
       createdAt: ago(5_000),
+      guaranteed: true,
     });
     const scheduler = new CronScheduler(makeStorage(tmpDir, [job]), makePi());
     const execSpy = vi
@@ -276,13 +280,14 @@ describe("start", () => {
     expect(schedSpy).toHaveBeenCalledWith(job);
   });
 
-  it("missed interval job: executes it AND schedules it for future firings", () => {
+  it("guaranteed interval job: executes it AND schedules it for future firings", () => {
     const job = makeJob({
       id: "missed-interval",
       type: "interval",
       intervalMs: 30_000,
       schedule: "30s",
       createdAt: ago(60_000),
+      guaranteed: true,
     });
     const scheduler = new CronScheduler(makeStorage(tmpDir, [job]), makePi());
     const execSpy = vi
@@ -296,6 +301,107 @@ describe("start", () => {
 
     expect(execSpy).toHaveBeenCalledWith(job);
     expect(schedSpy).toHaveBeenCalledWith(job);
+  });
+
+  // ── guaranteed: false (default) ──────────────────────────────────────────────
+
+  it("non-guaranteed missed once job: marks as failed, does not execute or schedule", () => {
+    const job = makeJob({
+      id: "missed-once-ng",
+      type: "once",
+      schedule: ago(60_000),
+      guaranteed: false,
+    });
+    const storage = makeStorage(tmpDir, [job]);
+    const scheduler = new CronScheduler(storage, makePi());
+    const execSpy = vi
+      .spyOn(scheduler as any, "executeJobIfLeader")
+      .mockResolvedValue(undefined);
+    const schedSpy = vi
+      .spyOn(scheduler as any, "scheduleJob")
+      .mockImplementation(() => {});
+
+    scheduler.start();
+
+    expect(execSpy).not.toHaveBeenCalled();
+    expect(schedSpy).not.toHaveBeenCalled();
+    expect(storage.updateJob).toHaveBeenCalledWith(
+      "missed-once-ng",
+      expect.objectContaining({ enabled: false, lastStatus: "error" })
+    );
+  });
+
+  it("non-guaranteed missed once job with no guaranteed field (legacy): marks as failed", () => {
+    // Jobs created before the guaranteed flag was added have guaranteed: undefined,
+    // which is falsy — they must not run on startup.
+    const job = makeJob({
+      id: "missed-once-legacy",
+      type: "once",
+      schedule: ago(60_000),
+      // guaranteed deliberately absent
+    });
+    const storage = makeStorage(tmpDir, [job]);
+    const scheduler = new CronScheduler(storage, makePi());
+    const execSpy = vi
+      .spyOn(scheduler as any, "executeJobIfLeader")
+      .mockResolvedValue(undefined);
+
+    scheduler.start();
+
+    expect(execSpy).not.toHaveBeenCalled();
+    expect(storage.updateJob).toHaveBeenCalledWith(
+      "missed-once-legacy",
+      expect.objectContaining({ enabled: false, lastStatus: "error" })
+    );
+  });
+
+  it("non-guaranteed missed cron job: silently drops execution, reschedules for future", () => {
+    const job = makeJob({
+      id: "missed-cron-ng",
+      type: "cron",
+      schedule: "* * * * * *",
+      createdAt: ago(5_000),
+      guaranteed: false,
+    });
+    const storage = makeStorage(tmpDir, [job]);
+    const scheduler = new CronScheduler(storage, makePi());
+    const execSpy = vi
+      .spyOn(scheduler as any, "executeJobIfLeader")
+      .mockResolvedValue(undefined);
+    const schedSpy = vi
+      .spyOn(scheduler as any, "scheduleJob")
+      .mockImplementation(() => {});
+
+    scheduler.start();
+
+    expect(execSpy).not.toHaveBeenCalled();
+    expect(schedSpy).toHaveBeenCalledWith(job);
+    expect(storage.updateJob).not.toHaveBeenCalled();
+  });
+
+  it("non-guaranteed missed interval job: silently drops execution, reschedules for future", () => {
+    const job = makeJob({
+      id: "missed-interval-ng",
+      type: "interval",
+      intervalMs: 30_000,
+      schedule: "30s",
+      createdAt: ago(60_000),
+      guaranteed: false,
+    });
+    const storage = makeStorage(tmpDir, [job]);
+    const scheduler = new CronScheduler(storage, makePi());
+    const execSpy = vi
+      .spyOn(scheduler as any, "executeJobIfLeader")
+      .mockResolvedValue(undefined);
+    const schedSpy = vi
+      .spyOn(scheduler as any, "scheduleJob")
+      .mockImplementation(() => {});
+
+    scheduler.start();
+
+    expect(execSpy).not.toHaveBeenCalled();
+    expect(schedSpy).toHaveBeenCalledWith(job);
+    expect(storage.updateJob).not.toHaveBeenCalled();
   });
 
   it("future job: only schedules it, does not execute", () => {

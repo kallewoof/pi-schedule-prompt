@@ -276,9 +276,12 @@ export class CronWidget {
       // Run count (pad to 3 chars for alignment)
       const countText = theme.fg("accent", job.runCount.toString().padEnd(3));
 
+      // Guaranteed flag
+      const guaranteedBadge = job.guaranteed ? theme.fg("warning", "⚡") : " ";
+
       // Combine into a row with proper spacing
       lines.push(
-        ` ${statusIcon} ${nameText} ${scheduleText} ${promptText} ${nextText} ${lastText} ${countText}`
+        ` ${statusIcon}${guaranteedBadge} ${nameText} ${scheduleText} ${promptText} ${nextText} ${lastText} ${countText}`
       );
     }
 
