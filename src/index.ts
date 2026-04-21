@@ -16,7 +16,7 @@ import { CronStorage } from "./storage.js";
 import { CronScheduler } from "./scheduler.js";
 import { createCronTool } from "./tool.js";
 import { CronWidget } from "./ui/cron-widget.js";
-import { formatLocalDateTime, sortJobsByNextRun } from "./utils.js";
+import { formatLocalDateTime, formatSchedule, sortJobsByNextRun } from "./utils.js";
 import { nanoid } from "nanoid";
 
 export default async function (pi: ExtensionAPI) {
@@ -162,7 +162,7 @@ export default async function (pi: ExtensionAPI) {
           for (const { job, nextRun } of sorted) {
             const status = job.enabled ? "✓" : "✗";
             lines.push(`${status} ${job.name} (${job.id})`);
-            lines.push(`  Schedule: ${job.schedule} | Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
+            lines.push(`  Schedule: ${formatSchedule(job.type, job.schedule)} | Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
             lines.push(`  Prompt: ${job.prompt}`);
             if (nextRun) {
               lines.push(`  Next run: ${formatLocalDateTime(nextRun)}`);

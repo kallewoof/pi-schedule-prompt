@@ -8,6 +8,14 @@ export function formatLocalDateTime(date: Date): string {
   return `${MONTHS[date.getMonth()]} ${date.getDate()} ${h}:${m}`;
 }
 
+export function formatISOLocal(iso: string): string {
+  return formatLocalDateTime(new Date(iso));
+}
+
+export function formatSchedule(type: string, schedule: string): string {
+  return type === "once" ? formatISOLocal(schedule) : schedule;
+}
+
 export function sortJobsByNextRun(
   jobs: CronJob[],
   getNextRun: (id: string) => Date | null
