@@ -5,6 +5,7 @@ import type { CronToolParamsType, CronToolDetails, CronJob, CronJobType } from "
 import { CronToolParams } from "./types.js";
 import type { CronStorage } from "./storage.js";
 import { CronScheduler } from "./scheduler.js";
+import { formatLocalDateTime, formatISOLocal, formatRelativeHint, formatSchedule, sortJobsByNextRun } from "./utils.js";
 
 /**
  * Create the schedule_prompt tool definition
@@ -142,7 +143,7 @@ export function createCronTool(
               content: [
                 {
                   type: "text",
-                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${job.schedule}\nPrompt: ${job.prompt}`,
+                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${formatSchedule(job.type, job.schedule)}\nPrompt: ${job.prompt}`,
                 },
               ],
               details,
@@ -320,24 +321,27 @@ export function createCronTool(
 
           case "list": {
             const jobs = storage.getAllJobs();
-            details.jobs = jobs;
 
             if (jobs.length === 0) {
+              details.jobs = [];
               return {
                 content: [{ type: "text", text: "No cron jobs configured." }],
                 details,
               };
             }
 
+            const jobsWithNext = sortJobsByNextRun(jobs, id => scheduler.getNextRun(id));
+            details.jobs = jobsWithNext.map(({ job }) => job);
+
             const lines = ["Configured cron jobs:", ""];
-            for (const job of jobs) {
+            for (const { job, nextRun } of jobsWithNext) {
               const status = job.enabled ? "✓" : "✗";
-              const nextRun = scheduler.getNextRun(job.id);
-              const nextStr = nextRun ? `Next: ${nextRun.toISOString()}` : "";
-              const lastStr = job.lastRun ? `Last: ${job.lastRun}` : "Never run";
+              const nextHint = nextRun ? formatRelativeHint(nextRun) : "";
+              const nextStr = nextRun ? `Next: ${formatLocalDateTime(nextRun)}${nextHint ? ` (${nextHint})` : ""}` : "";
+              const lastStr = job.lastRun ? `Last: ${formatISOLocal(job.lastRun)}` : "Never run";
 
               lines.push(`${status} ${job.name} (${job.id})`);
-              lines.push(`  Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Schedule: ${job.schedule} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
+              lines.push(`  Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Schedule: ${formatSchedule(job.type, job.schedule)} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
               lines.push(`  Prompt: ${job.prompt}`);
               lines.push(`  ${lastStr} ${nextStr ? `| ${nextStr}` : ""}`);
               lines.push(`  Runs: ${job.runCount} | Status: ${job.lastStatus || "pending"}`);
@@ -428,11 +432,11 @@ export function createCronTool(
           const recurringStr = job.type !== "once" ? theme.fg("success", "yes") : theme.fg("dim", "no");
           const guaranteedStr = job.guaranteed ? theme.fg("warning", "⚡ yes") : theme.fg("dim", "no");
           lines.push(
-            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Recurring:")} ${recurringStr} ${theme.fg("dim", "| Schedule:")} ${job.schedule} ${theme.fg("dim", "| Guaranteed:")} ${guaranteedStr}`
+            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Recurring:")} ${recurringStr} ${theme.fg("dim", "| Schedule:")} ${formatSchedule(job.type, job.schedule)} ${theme.fg("dim", "| Guaranteed:")} ${guaranteedStr}`
           );
           lines.push(`  ${theme.fg("dim", "Prompt:")} ${job.prompt}`);
           if (job.lastRun) {
-            lines.push(`  ${theme.fg("dim", "Last run:")} ${job.lastRun}`);
+            lines.push(`  ${theme.fg("dim", "Last run:")} ${formatISOLocal(job.lastRun)}`);
           }
           lines.push(`  ${theme.fg("dim", "Runs:")} ${job.runCount}`);
         }

@@ -36,17 +36,27 @@ export class CronStorage {
    * Save scheduled prompts to disk
    */
   save(store: CronStore): void {
-    try {
-      // Ensure .pi directory exists
-      if (!fs.existsSync(this.piDir)) {
-        fs.mkdirSync(this.piDir, { recursive: true });
-      }
-
-      // Write atomically using temp file
-      const tempPath = `${this.storePath}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify(store, null, 2), "utf-8");
+    const tempPath = `${this.storePath}.tmp`;
+    const payload = JSON.stringify(store, null, 2);
+    const attempt = () => {
+      fs.mkdirSync(this.piDir, { recursive: true });
+      fs.writeFileSync(tempPath, payload, "utf-8");
       fs.renameSync(tempPath, this.storePath);
-    } catch (error) {
+    };
+    try {
+      attempt();
+    } catch (error: any) {
+      // Recover from a transient missing-directory race (e.g. .pi/ removed
+      // between writeFileSync and renameSync). One retry is enough.
+      if (error?.code === "ENOENT") {
+        try {
+          attempt();
+          return;
+        } catch (retryError) {
+          console.error("Failed to save scheduled prompts (after retry):", retryError);
+          throw retryError;
+        }
+      }
       console.error("Failed to save scheduled prompts:", error);
       throw error;
     }
