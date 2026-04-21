@@ -11,6 +11,7 @@ import { Container, Text, Spacer } from "@mariozechner/pi-tui";
 import type { CronStorage } from "../storage.js";
 import type { CronScheduler } from "../scheduler.js";
 import type { CronJob } from "../types.js";
+import { formatLocalDateTime, sortJobsByNextRun } from "../utils.js";
 
 const WIDGET_ID = "schedule-prompts";
 
@@ -94,23 +95,6 @@ function humanizeCron(expression: string): string {
   return normalized.length > 15 ? normalized.substring(0, 12) + '...' : normalized;
 }
 
-/**
- * Format ISO timestamp to short readable format (e.g., "Feb 13 15:30")
- */
-function formatISOShort(iso: string): string {
-  try {
-    const date = new Date(iso);
-    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    const month = months[date.getMonth()];
-    const day = date.getDate();
-    const hours = date.getHours().toString().padStart(2, '0');
-    const minutes = date.getMinutes().toString().padStart(2, '0');
-    return `${month} ${day} ${hours}:${minutes}`;
-  } catch {
-    // Fallback if parsing fails
-    return iso.length > 18 ? iso.substring(0, 15) + '...' : iso;
-  }
-}
 
 /**
  * Create and manage the cron widget
@@ -203,12 +187,14 @@ export class CronWidget {
    */
   private renderWidget(width: number, theme: any): string[] {
     const jobs = this.storage.getAllJobs();
-    
+
     // Deduplicate jobs by ID (safeguard against rendering issues)
     const uniqueJobs = Array.from(
       new Map(jobs.map(job => [job.id, job])).values()
     );
-    
+
+    const sortedEntries = sortJobsByNextRun(uniqueJobs, id => this.scheduler.getNextRun(id));
+
     const container = new Container();
     const borderColor = (s: string) => theme.fg("accent", s);
 
@@ -225,7 +211,7 @@ export class CronWidget {
 
     // Job rows
     const lines: string[] = [];
-    for (const job of uniqueJobs) {
+    for (const { job, nextRun } of sortedEntries) {
       // Status icon
       let statusIcon: string;
       if (!job.enabled) {
@@ -248,8 +234,7 @@ export class CronWidget {
       if (job.type === "cron") {
         scheduleRaw = humanizeCron(job.schedule);
       } else if (job.type === "once" && job.schedule.includes("T")) {
-        // Format ISO timestamps
-        scheduleRaw = formatISOShort(job.schedule);
+        try { scheduleRaw = formatLocalDateTime(new Date(job.schedule)); } catch { scheduleRaw = job.schedule.substring(0, 15); }
       } else {
         // For intervals and relative times, show as-is
         scheduleRaw = job.schedule.length > 15 ? job.schedule.substring(0, 12) + "..." : job.schedule;
@@ -263,7 +248,6 @@ export class CronWidget {
       const promptText = theme.fg("dim", promptPadded);
 
       // Next run (max 10 chars, pad before coloring)
-      const nextRun = this.scheduler.getNextRun(job.id);
       const nextRaw = nextRun ? formatRelativeTime(nextRun) : "-";
       const nextPadded = nextRaw.padEnd(10);
       const nextText = nextPadded;

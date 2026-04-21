@@ -5,6 +5,7 @@ import type { CronToolParamsType, CronToolDetails, CronJob, CronJobType } from "
 import { CronToolParams } from "./types.js";
 import type { CronStorage } from "./storage.js";
 import { CronScheduler } from "./scheduler.js";
+import { formatLocalDateTime, sortJobsByNextRun } from "./utils.js";
 
 /**
  * Create the schedule_prompt tool definition
@@ -320,20 +321,22 @@ export function createCronTool(
 
           case "list": {
             const jobs = storage.getAllJobs();
-            details.jobs = jobs;
 
             if (jobs.length === 0) {
+              details.jobs = [];
               return {
                 content: [{ type: "text", text: "No cron jobs configured." }],
                 details,
               };
             }
 
+            const jobsWithNext = sortJobsByNextRun(jobs, id => scheduler.getNextRun(id));
+            details.jobs = jobsWithNext.map(({ job }) => job);
+
             const lines = ["Configured cron jobs:", ""];
-            for (const job of jobs) {
+            for (const { job, nextRun } of jobsWithNext) {
               const status = job.enabled ? "✓" : "✗";
-              const nextRun = scheduler.getNextRun(job.id);
-              const nextStr = nextRun ? `Next: ${nextRun.toISOString()}` : "";
+              const nextStr = nextRun ? `Next: ${formatLocalDateTime(nextRun)}` : "";
               const lastStr = job.lastRun ? `Last: ${job.lastRun}` : "Never run";
 
               lines.push(`${status} ${job.name} (${job.id})`);

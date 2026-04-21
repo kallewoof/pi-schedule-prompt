@@ -16,6 +16,7 @@ import { CronStorage } from "./storage.js";
 import { CronScheduler } from "./scheduler.js";
 import { createCronTool } from "./tool.js";
 import { CronWidget } from "./ui/cron-widget.js";
+import { formatLocalDateTime, sortJobsByNextRun } from "./utils.js";
 import { nanoid } from "nanoid";
 
 export default async function (pi: ExtensionAPI) {
@@ -150,15 +151,15 @@ export default async function (pi: ExtensionAPI) {
             return;
           }
 
+          const sorted = sortJobsByNextRun(jobs, id => scheduler.getNextRun(id));
           const lines = ["Scheduled prompts:", ""];
-          for (const job of jobs) {
+          for (const { job, nextRun } of sorted) {
             const status = job.enabled ? "✓" : "✗";
-            const nextRun = scheduler.getNextRun(job.id);
             lines.push(`${status} ${job.name} (${job.id})`);
             lines.push(`  Schedule: ${job.schedule} | Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
             lines.push(`  Prompt: ${job.prompt}`);
             if (nextRun) {
-              lines.push(`  Next run: ${nextRun.toISOString()}`);
+              lines.push(`  Next run: ${formatLocalDateTime(nextRun)}`);
             }
             lines.push(`  Runs: ${job.runCount}`);
             lines.push("");
