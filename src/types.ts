@@ -1,5 +1,5 @@
-import type { Static } from "@sinclair/typebox";
-import { Type } from "@sinclair/typebox";
+import type { Static } from "typebox";
+import { Type } from "typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
 
 /**
@@ -10,7 +10,7 @@ export type CronJobType = "cron" | "once" | "interval";
 /**
  * Status of the last job execution
  */
-export type CronJobStatus = "success" | "error" | "running";
+export type CronJobStatus = "success" | "error" | "running" | "sent";
 
 /**
  * A scheduled cron job
@@ -42,6 +42,8 @@ export interface CronJob {
   runCount: number;
   /** Optional description */
   description?: string;
+  /** If true, run missed jobs immediately on startup; if false (default), drop missed recurring or mark missed one-time as failed */
+  guaranteed?: boolean;
 }
 
 /**
@@ -91,14 +93,20 @@ export const CronToolParams = Type.Object({
       description: "Job ID for remove, enable, disable, or update actions",
     })
   ),
-  type: Type.Optional(
+  jobType: Type.Optional(
     StringEnum(["cron", "once", "interval"], {
-      description: "Job type. Use 'once' for relative times like '+10s'. Default is cron",
+      description: "Job type: 'cron' (recurring, default), 'once' (single ISO timestamp or relative time like +10s), 'interval' (repeating, e.g. 5m)",
     })
   ),
-  description: Type.Optional(
+  jobDescription: Type.Optional(
     Type.String({
-      description: "Optional job description",
+      description: "Optional human-readable description of what this job does",
+    })
+  ),
+  guaranteed: Type.Optional(
+    Type.Boolean({
+      description:
+        "If true, run missed jobs immediately on startup. If false (default), silently drop missed recurring jobs or mark missed one-time jobs as failed.",
     })
   ),
 });

@@ -113,6 +113,12 @@ export default async function (pi: ExtensionAPI) {
     cleanupSession(ctx);
   });
 
+  pi.on("agent_end", async (event) => {
+    if (scheduler) {
+      scheduler.notifyAgentEnd(event.messages);
+    }
+  });
+
   // --- Register /schedule-prompt command ---
 
   pi.registerCommand("schedule-prompt", {
@@ -152,7 +158,7 @@ export default async function (pi: ExtensionAPI) {
             const status = job.enabled ? "✓" : "✗";
             const nextRun = scheduler.getNextRun(job.id);
             lines.push(`${status} ${job.name} (${job.id})`);
-            lines.push(`  Schedule: ${job.schedule} | Type: ${job.type}`);
+            lines.push(`  Schedule: ${job.schedule} | Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
             lines.push(`  Prompt: ${job.prompt}`);
             if (nextRun) {
               lines.push(`  Next run: ${nextRun.toISOString()}`);

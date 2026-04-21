@@ -115,10 +115,11 @@ export class CronStorage {
     return store.jobs;
   }
 
-  /**
-   * Get storage file path
-   */
   getStorePath(): string {
     return this.storePath;
+  }
+
+  getPiDir(): string {
+    return this.piDir;
   }
 }
