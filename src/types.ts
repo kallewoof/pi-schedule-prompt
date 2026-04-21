@@ -52,6 +52,7 @@ export interface CronJob {
 export interface CronStore {
   jobs: CronJob[];
   version: number;
+  widgetVisible?: boolean;
 }
 
 /**
