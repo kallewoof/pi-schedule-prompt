@@ -115,6 +115,17 @@ export class CronStorage {
     return store.jobs;
   }
 
+  getWidgetVisible(): boolean {
+    const store = this.load();
+    return store.widgetVisible !== false;
+  }
+
+  setWidgetVisible(visible: boolean): void {
+    const store = this.load();
+    store.widgetVisible = visible;
+    this.save(store);
+  }
+
   getStorePath(): string {
     return this.storePath;
   }

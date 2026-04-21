@@ -23,6 +23,7 @@ export default async function (pi: ExtensionAPI) {
   let scheduler: CronScheduler;
   let widget: CronWidget;
   let widgetVisible = true;
+  let storageForVisibility: CronStorage | undefined;
 
   // Register custom message renderer for scheduled prompts
   pi.registerMessageRenderer("scheduled_prompt", (message, _options, theme) => {
@@ -50,6 +51,8 @@ export default async function (pi: ExtensionAPI) {
   const initializeSession = (ctx: any) => {
     // Create storage and scheduler
     storage = new CronStorage(ctx.cwd);
+    storageForVisibility = storage;
+    widgetVisible = storage.getWidgetVisible();
     scheduler = new CronScheduler(storage, pi);
     widget = new CronWidget(storage, scheduler, pi, () => widgetVisible);
 
@@ -332,6 +335,7 @@ export default async function (pi: ExtensionAPI) {
 
         case "toggleWidget": {
           widgetVisible = !widgetVisible;
+          storageForVisibility?.setWidgetVisible(widgetVisible);
           if (widgetVisible) {
             widget.show(ctx);
             ctx.ui.notify("Widget enabled (shows when jobs exist)", "info");
