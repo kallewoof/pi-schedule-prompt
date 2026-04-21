@@ -10,7 +10,7 @@ export type CronJobType = "cron" | "once" | "interval";
 /**
  * Status of the last job execution
  */
-export type CronJobStatus = "success" | "error" | "running";
+export type CronJobStatus = "success" | "error" | "running" | "sent";
 
 /**
  * A scheduled cron job

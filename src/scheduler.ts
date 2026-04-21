@@ -5,9 +5,14 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { CronJob, CronChangeEvent } from "./types.js";
 import type { CronStorage } from "./storage.js";
 
+const GUARANTEED_RETRY_DELAY_MS = 10 * 60 * 1000;
+
 export class CronScheduler {
   private jobs = new Map<string, Cron>();
   private intervals = new Map<string, NodeJS.Timeout>();
+  private retries = new Map<string, NodeJS.Timeout>();
+  /** Job IDs for guaranteed once-jobs that have been sent but not yet confirmed by agent_end. FIFO. */
+  private pendingGuaranteedOnce: string[] = [];
   private readonly storage: CronStorage;
   private readonly pi: ExtensionAPI;
   private readonly leaderPidPath: string;
@@ -58,6 +63,12 @@ export class CronScheduler {
       clearInterval(interval);
     }
     this.intervals.clear();
+
+    for (const retry of this.retries.values()) {
+      clearTimeout(retry);
+    }
+    this.retries.clear();
+    this.pendingGuaranteedOnce = [];
   }
 
   addJob(job: CronJob): void {
@@ -87,6 +98,45 @@ export class CronScheduler {
       return next || null;
     }
     return null;
+  }
+
+  /**
+   * Called by the host when an agent turn ends.
+   * Resolves the oldest pending guaranteed once-job: removes it on success,
+   * or schedules a 10-minute retry on model error.
+   */
+  notifyAgentEnd(messages: readonly unknown[]): void {
+    const jobId = this.pendingGuaranteedOnce.shift();
+    if (!jobId) return;
+
+    const job = this.storage.getJob(jobId);
+    if (!job || !job.enabled || !job.guaranteed) return;
+
+    const modelFailed = messages.some(
+      (m) =>
+        typeof m === "object" &&
+        m !== null &&
+        (m as Record<string, unknown>)["role"] === "assistant" &&
+        (m as Record<string, unknown>)["stopReason"] === "error"
+    );
+
+    if (!modelFailed) {
+      this.storage.removeJob(jobId);
+      this.emitChange({ type: "remove", jobId });
+      return;
+    }
+
+    this.storage.updateJob(jobId, { lastStatus: "error" });
+    this.emitChange({ type: "error", jobId, error: "Model error (retrying in 10m)" });
+
+    const retry = setTimeout(() => {
+      this.retries.delete(jobId);
+      const current = this.storage.getJob(jobId);
+      if (current && current.enabled && current.guaranteed) {
+        void this.executeJobIfLeader(current);
+      }
+    }, GUARANTEED_RETRY_DELAY_MS);
+    this.retries.set(jobId, retry);
   }
 
   // --- Leader election ---
@@ -151,7 +201,10 @@ export class CronScheduler {
 
   private isMissed(job: CronJob, now: Date): boolean {
     if (job.type === "once") {
-      return new Date(job.schedule) <= now && !job.lastRun;
+      const pastDue = new Date(job.schedule) <= now;
+      const neverRan = !job.lastRun;
+      const guaranteedRetry = !!job.guaranteed && (job.lastStatus === "error" || job.lastStatus === "sent");
+      return pastDue && (neverRan || guaranteedRetry);
     }
 
     if (job.type === "interval" && job.intervalMs) {
@@ -222,6 +275,17 @@ export class CronScheduler {
       clearInterval(interval);
       this.intervals.delete(id);
     }
+
+    const retry = this.retries.get(id);
+    if (retry) {
+      clearTimeout(retry);
+      this.retries.delete(id);
+    }
+
+    const pendingIdx = this.pendingGuaranteedOnce.indexOf(id);
+    if (pendingIdx !== -1) {
+      this.pendingGuaranteedOnce.splice(pendingIdx, 1);
+    }
   }
 
   // --- Execution ---
@@ -248,7 +312,11 @@ export class CronScheduler {
 
       this.pi.sendUserMessage(job.prompt, { deliverAs: "followUp" });
 
-      if (job.type === "once") {
+      if (job.type === "once" && job.guaranteed) {
+        // Keep in storage — wait for agent_end to confirm delivery before removing.
+        this.storage.updateJob(job.id, { lastStatus: "sent" });
+        this.pendingGuaranteedOnce.push(job.id);
+      } else if (job.type === "once") {
         this.storage.removeJob(job.id);
         this.emitChange({ type: "remove", jobId: job.id });
       } else {
@@ -263,16 +331,31 @@ export class CronScheduler {
       }
     } catch (error) {
       console.error(`Failed to execute job ${job.id}:`, error);
-      this.storage.updateJob(job.id, {
-        lastRun: new Date().toISOString(),
-        lastStatus: "error",
-        ...(job.type === "once" && { enabled: false }),
-      });
-      this.emitChange({
-        type: "error",
-        jobId: job.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      const errMsg = error instanceof Error ? error.message : String(error);
+
+      if (job.guaranteed) {
+        this.storage.updateJob(job.id, {
+          lastRun: new Date().toISOString(),
+          lastStatus: "error",
+        });
+        this.emitChange({ type: "error", jobId: job.id, error: `${errMsg} (retrying in 10m)` });
+
+        const retry = setTimeout(() => {
+          this.retries.delete(job.id);
+          const current = this.storage.getJob(job.id);
+          if (current && current.enabled && current.guaranteed) {
+            void this.executeJobIfLeader(current);
+          }
+        }, GUARANTEED_RETRY_DELAY_MS);
+        this.retries.set(job.id, retry);
+      } else {
+        this.storage.updateJob(job.id, {
+          lastRun: new Date().toISOString(),
+          lastStatus: "error",
+          ...(job.type === "once" && { enabled: false }),
+        });
+        this.emitChange({ type: "error", jobId: job.id, error: errMsg });
+      }
     }
   }
 

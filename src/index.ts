@@ -117,6 +117,12 @@ export default async function (pi: ExtensionAPI) {
     cleanupSession(ctx);
   });
 
+  pi.on("agent_end", async (event) => {
+    if (scheduler) {
+      scheduler.notifyAgentEnd(event.messages);
+    }
+  });
+
   // --- Register /schedule-prompt command ---
 
   pi.registerCommand("schedule-prompt", {
