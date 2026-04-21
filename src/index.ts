@@ -100,18 +100,6 @@ export default async function (pi: ExtensionAPI) {
     initializeSession(ctx);
   });
 
-  pi.on("session_switch", async (_event, ctx) => {
-    autoCleanupDisabledJobs();
-    cleanupSession(ctx);
-    initializeSession(ctx);
-  });
-
-  pi.on("session_fork", async (_event, ctx) => {
-    autoCleanupDisabledJobs();
-    cleanupSession(ctx);
-    initializeSession(ctx);
-  });
-
   pi.on("session_shutdown", async (_event, ctx) => {
     autoCleanupDisabledJobs();
     cleanupSession(ctx);
