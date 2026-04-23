@@ -28,7 +28,7 @@
     "@mariozechner/pi-ai": "file:../pi-mono/packages/ai",
     "@mariozechner/pi-coding-agent": "file:../pi-mono/packages/coding-agent",
     "@mariozechner/pi-tui": "file:../pi-mono/packages/tui",
-    "@sinclair/typebox": "file:../pi-mono/node_modules/@sinclair/typebox",
+    "typebox": "file:../pi-mono/node_modules/typebox",
     "croner": "^8.0.0",
     "nanoid": "^5.0.0"
   },

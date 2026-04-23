@@ -143,8 +143,7 @@ export class CronScheduler {
         const modelFailed = this.agentEndHasError(messages);
 
         if (!modelFailed) {
-          this.storage.removeJob(jobId);
-          this.emitChange({ type: "remove", jobId });
+          this.confirmJobSuccess(job);
         } else {
           this.storage.updateJob(jobId, { lastStatus: "error" });
           this.emitChange({ type: "error", jobId, error: "Model error (retrying in 10m)" });
@@ -156,7 +155,7 @@ export class CronScheduler {
       return;
     }
 
-    // First-time send: confirm or retry the oldest pending guaranteed once-job.
+    // First-time send: confirm or retry the oldest pending guaranteed job.
     const jobId = this.pendingGuaranteedOnce.shift();
     if (!jobId) {
       this.processNextDeferred();
@@ -172,8 +171,7 @@ export class CronScheduler {
     const modelFailed = this.agentEndHasError(messages);
 
     if (!modelFailed) {
-      this.storage.removeJob(jobId);
-      this.emitChange({ type: "remove", jobId });
+      this.confirmJobSuccess(job);
       this.processNextDeferred();
       return;
     }
@@ -182,6 +180,26 @@ export class CronScheduler {
     this.emitChange({ type: "error", jobId, error: "Model error (retrying in 10m)" });
     this.scheduleRetryTimer(jobId);
     this.processNextDeferred();
+  }
+
+  /**
+   * Mark a guaranteed job as successfully processed by the model.
+   * Once-jobs are removed from storage; recurring jobs have their lastRun updated.
+   */
+  private confirmJobSuccess(job: CronJob): void {
+    if (job.type === "once") {
+      this.storage.removeJob(job.id);
+      this.emitChange({ type: "remove", jobId: job.id });
+    } else {
+      const nextRun = this.getNextRun(job.id);
+      this.storage.updateJob(job.id, {
+        lastRun: new Date().toISOString(),
+        lastStatus: "success",
+        runCount: job.runCount + 1,
+        nextRun: nextRun?.toISOString(),
+      });
+      this.emitChange({ type: "fire", job });
+    }
   }
 
   // --- Leader election ---
@@ -253,11 +271,17 @@ export class CronScheduler {
     }
 
     if (job.type === "interval" && job.intervalMs) {
+      if (job.guaranteed && (job.lastStatus === "error" || job.lastStatus === "sent")) {
+        return true;
+      }
       const checkFrom = new Date(job.lastRun ?? job.createdAt);
       return checkFrom.getTime() + job.intervalMs <= now.getTime();
     }
 
     if (job.type === "cron") {
+      if (job.guaranteed && (job.lastStatus === "error" || job.lastStatus === "sent")) {
+        return true;
+      }
       const checkFrom = new Date(job.lastRun ?? job.createdAt);
       try {
         const tempCron = new Cron(job.schedule, { paused: true });
@@ -390,8 +414,9 @@ export class CronScheduler {
       // Track which job's message is now at the tail of context.
       this.contextTailJobId = job.id;
 
-      if (job.type === "once" && job.guaranteed) {
-        // Keep in storage — wait for agent_end to confirm delivery before removing.
+      if (job.guaranteed) {
+        // Defer the success/lastRun update until agent_end confirms the model processed
+        // the prompt. For once-jobs this also prevents premature removal from storage.
         this.storage.updateJob(job.id, { lastStatus: "sent" });
         this.pendingGuaranteedOnce.push(job.id);
       } else if (job.type === "once") {

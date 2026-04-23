@@ -502,6 +502,139 @@ describe("sending flag serialises concurrent sends at startup", () => {
   });
 });
 
+// ---- guaranteed recurring job agent_end tracking ----
+
+describe("guaranteed recurring (cron/interval) job waits for agent_end before marking success", () => {
+  function makeCronJob(overrides: Partial<CronJob> = {}): CronJob {
+    return {
+      id: "cron-1",
+      name: "Daily Routine",
+      schedule: "0 8 * * * *", // daily at 08:00
+      prompt: "good morning",
+      enabled: true,
+      type: "cron",
+      runCount: 3,
+      createdAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+      lastRun: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(), // ran yesterday
+      lastStatus: "success",
+      guaranteed: true,
+      ...overrides,
+    };
+  }
+
+  it("does not update lastRun immediately after send — defers until agent_end", async () => {
+    const job = makeCronJob();
+    const lastRunBefore = job.lastRun!;
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+    await executeJob(scheduler, job);
+
+    // sendUserMessage should have fired
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // lastRun must NOT have been bumped yet — it should stay as yesterday's value
+    const updateCalls = storage.updateJob.mock.calls;
+    const anyLastRunUpdate = updateCalls.some(
+      ([, partial]: [string, Partial<CronJob>]) => partial.lastRun !== undefined && partial.lastRun !== lastRunBefore
+    );
+    expect(anyLastRunUpdate).toBe(false);
+  });
+
+  it("updates lastRun and marks success after agent_end reports success", async () => {
+    const job = makeCronJob();
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+    await executeJob(scheduler, job);
+
+    // Clear the call log so we can assert that the success update fires
+    // in response to notifyAgentEnd, not prematurely in executeJob.
+    storage.updateJob.mockClear();
+
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+
+    expect(storage.updateJob).toHaveBeenCalledWith(
+      job.id,
+      expect.objectContaining({ lastStatus: "success", runCount: job.runCount + 1 })
+    );
+    const lastRunUpdateCalls = storage.updateJob.mock.calls.filter(
+      ([, partial]: [string, Partial<CronJob>]) => partial.lastRun !== undefined
+    );
+    expect(lastRunUpdateCalls.length).toBeGreaterThan(0);
+    // The job must not be removed — it's recurring
+    expect(storage.removeJob).not.toHaveBeenCalled();
+  });
+
+  it("does not remove the recurring job from storage on agent_end success", async () => {
+    const job = makeCronJob();
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+    await executeJob(scheduler, job);
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+
+    expect(storage.removeJob).not.toHaveBeenCalled();
+  });
+
+  it("schedules a retry when agent_end reports model error", async () => {
+    const job = makeCronJob();
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+    await executeJob(scheduler, job);
+
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "error" }]);
+
+    expect(storage.updateJob).toHaveBeenCalledWith(job.id, { lastStatus: "error" });
+    expect(storage.removeJob).not.toHaveBeenCalled();
+
+    // 10-minute retry fires
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    expect(pi.retryLastTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("isMissed returns true for guaranteed cron job with lastStatus 'error' even when next natural occurrence is still in the future", () => {
+    const scheduler = makeScheduler(makeMockStorage(), makeMockPi());
+    // lastRun = just now → next natural occurrence is tomorrow → timing alone says "not missed"
+    // but guaranteed + error should override and fire immediately
+    const job = makeCronJob({
+      schedule: "0 8 * * * *",
+      lastRun: new Date().toISOString(),
+      lastStatus: "error",
+      guaranteed: true,
+    });
+    expect((scheduler as any).isMissed(job, new Date())).toBe(true);
+  });
+
+  it("isMissed returns true for guaranteed cron job with lastStatus 'sent' even when next natural occurrence is still in the future", () => {
+    const scheduler = makeScheduler(makeMockStorage(), makeMockPi());
+    const job = makeCronJob({
+      schedule: "0 8 * * * *",
+      lastRun: new Date().toISOString(),
+      lastStatus: "sent",
+      guaranteed: true,
+    });
+    expect((scheduler as any).isMissed(job, new Date())).toBe(true);
+  });
+
+  it("isMissed returns false for non-guaranteed cron job with lastStatus 'error' when next natural occurrence is in the future", () => {
+    const scheduler = makeScheduler(makeMockStorage(), makeMockPi());
+    // lastRun = just now → next occurrence is tomorrow → not missed
+    const job = makeCronJob({
+      schedule: "0 8 * * * *",
+      lastRun: new Date().toISOString(),
+      lastStatus: "error",
+      guaranteed: false,
+    });
+    expect((scheduler as any).isMissed(job, new Date())).toBe(false);
+  });
+});
+
 // ---- isMissed restart-recovery tests ----
 
 describe("isMissed restart recovery for guaranteed once-jobs", () => {
