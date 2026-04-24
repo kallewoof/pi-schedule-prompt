@@ -462,7 +462,9 @@ export class CronScheduler {
         details: { jobId: job.id, jobName: job.name, prompt: job.prompt },
       });
 
-      this.pi.sendUserMessage(job.prompt);
+      this.pi.sendUserMessage(
+        `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n${job.prompt}`
+      );
       // Both send calls succeeded — an agent turn is now in flight.
       // sending will be cleared by notifyAgentEnd when the turn completes.
       sendCompleted = true;
@@ -601,7 +603,9 @@ export class CronScheduler {
           display: true,
           details: { jobId: current.id, jobName: current.name, prompt: current.prompt },
         });
-        this.pi.sendUserMessage(current.prompt);
+        this.pi.sendUserMessage(
+          `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n${current.prompt}`
+        );
         this.contextTailJobId = jobId;
       } catch (error) {
         this.retrying = false;
