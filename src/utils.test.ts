@@ -40,14 +40,14 @@ describe("formatRelativeHint", () => {
     expect(formatRelativeHint(minutesFromNow(23 * 60 + 59))).toBe("in 23 hours");
   });
 
-  it("returns '1 hour and X minutes' for 1-2 hours with remaining minutes", () => {
-    expect(formatRelativeHint(minutesFromNow(90))).toBe("1 hour and 30 minutes");
-    expect(formatRelativeHint(minutesFromNow(61))).toBe("1 hour and 1 minute");
-    expect(formatRelativeHint(minutesFromNow(119))).toBe("1 hour and 59 minutes");
+  it("returns 'in 1 hour and X minutes' for 1-2 hours with remaining minutes", () => {
+    expect(formatRelativeHint(minutesFromNow(90))).toBe("in 1 hour and 30 minutes");
+    expect(formatRelativeHint(minutesFromNow(61))).toBe("in 1 hour and 1 minute");
+    expect(formatRelativeHint(minutesFromNow(119))).toBe("in 1 hour and 59 minutes");
   });
 
-  it("returns '1 hour' for exactly 1 hour away", () => {
-    expect(formatRelativeHint(minutesFromNow(60))).toBe("1 hour");
+  it("returns 'in 1 hour' for exactly 1 hour away", () => {
+    expect(formatRelativeHint(minutesFromNow(60))).toBe("in 1 hour");
   });
 
   it("returns 'X minutes' for under 1 hour", () => {

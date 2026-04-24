@@ -20,7 +20,7 @@ export function formatRelativeHint(date: Date): string {
   const minutes = totalMinutes % 60;
   if (hours >= 24) return "";
   if (hours >= 2) return `in ${hours} hours`;
-  if (hours === 1) return minutes > 0 ? `1 hour and ${minutes} minute${minutes === 1 ? "" : "s"}` : "1 hour";
+  if (hours === 1) return minutes > 0 ? `in 1 hour and ${minutes} minute${minutes === 1 ? "" : "s"}` : "in 1 hour";
   return `${totalMinutes} minute${totalMinutes === 1 ? "" : "s"}`;
 }
 
