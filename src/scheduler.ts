@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { Cron } from "croner";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import type { CronJob, CronChangeEvent } from "./types.js";
+import type { CronJob, CronChangeEvent, RunRecord } from "./types.js";
 import type { CronStorage } from "./storage.js";
 
 const GUARANTEED_RETRY_DELAY_MS = 10 * 60 * 1000;
@@ -46,6 +46,10 @@ export class CronScheduler {
   private readonly SENDING_WATCHDOG_MS = 5 * 60 * 1000;
   /** Tracks which job's prompt is at the tail of the agent context (last sendUserMessage). */
   private contextTailJobId: string | null = null;
+  /** Which job triggered the current agent turn (for output capture). */
+  private currentTurnJobId: string | null = null;
+  /** When the current turn's job was fired (ISO timestamp). */
+  private currentTurnStartTime: string | null = null;
 
   private readonly storage: CronStorage;
   private readonly pi: ExtensionAPI;
@@ -114,6 +118,8 @@ export class CronScheduler {
       this.sendingWatchdog = null;
     }
     this.contextTailJobId = null;
+    this.currentTurnJobId = null;
+    this.currentTurnStartTime = null;
   }
 
   addJob(job: CronJob): void {
@@ -189,6 +195,11 @@ export class CronScheduler {
     const wasScheduledTurn = this.currentTurnIsScheduled;
     this.currentTurnIsScheduled = true;
 
+    const turnJobId = this.currentTurnJobId;
+    const turnStartTime = this.currentTurnStartTime;
+    this.currentTurnJobId = null;
+    this.currentTurnStartTime = null;
+
     // Clear the in-flight flag and any outstanding watchdog.
     this.sending = false;
     if (this.sendingWatchdog !== null) {
@@ -207,8 +218,10 @@ export class CronScheduler {
         const modelFailed = this.agentEndHasError(messages);
 
         if (!modelFailed) {
+          this.captureRunRecord(job, messages, "success", turnStartTime);
           this.confirmJobSuccess(job);
         } else {
+          this.captureRunRecord(job, messages, "error", turnStartTime);
           this.storage.updateJob(jobId, { lastStatus: "error" });
           this.emitChange({ type: "error", jobId, error: "Model error (retrying in 10m)" });
           this.scheduleRetryTimer(jobId);
@@ -230,6 +243,11 @@ export class CronScheduler {
     // Scheduler-initiated turn: confirm or retry the oldest pending guaranteed job.
     const jobId = this.pendingGuaranteedOnce.shift();
     if (!jobId) {
+      // Non-guaranteed recurring job: capture output for /replay
+      if (turnJobId) {
+        const job = this.storage.getJob(turnJobId);
+        if (job) this.captureRunRecord(job, messages, "success", turnStartTime);
+      }
       this.processNextDeferred();
       return;
     }
@@ -243,11 +261,13 @@ export class CronScheduler {
     const modelFailed = this.agentEndHasError(messages);
 
     if (!modelFailed) {
+      this.captureRunRecord(job, messages, "success", turnStartTime);
       this.confirmJobSuccess(job);
       this.processNextDeferred();
       return;
     }
 
+    this.captureRunRecord(job, messages, "error", turnStartTime);
     this.storage.updateJob(jobId, { lastStatus: "error" });
     this.emitChange({ type: "error", jobId, error: "Model error (retrying in 10m)" });
     this.scheduleRetryTimer(jobId);
@@ -476,6 +496,16 @@ export class CronScheduler {
   }
 
   private async executeJob(job: CronJob): Promise<void> {
+    // Final guard after leadership wait: if agent started while we waited, defer
+    // instead of racing against isStreaming and producing an error.
+    if (this.agentRunning) {
+      this.sending = false;
+      if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
+        this.deferredActions.unshift({ type: "send", job });
+      }
+      return;
+    }
+
     console.log(`Executing scheduled prompt: ${job.name} (${job.id})`);
 
     let sendCompleted = false;
@@ -499,6 +529,8 @@ export class CronScheduler {
 
       // Track which job's message is now at the tail of context.
       this.contextTailJobId = job.id;
+      this.currentTurnJobId = job.id;
+      this.currentTurnStartTime = new Date().toISOString();
 
       if (job.guaranteed) {
         // Defer the success/lastRun update until agent_end confirms the model processed
@@ -539,15 +571,26 @@ export class CronScheduler {
         this.emitChange({ type: "fire", job });
       }
     } catch (error) {
-      console.error(`Failed to execute job ${job.id}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
 
       if (!sendCompleted) {
-        // The send itself threw — no agent turn was started, so notifyAgentEnd
-        // will never arrive to clear this flag. Unblock the deferred queue now.
+        // Race: pi's agent was still active despite our guard (agent_end fires before
+        // pi clears its isStreaming flag). Defer silently — notifyAgentEnd will call
+        // processNextDeferred once pi's turn truly ends.
+        if (errMsg.includes("Agent is already processing")) {
+          this.sending = false;
+          if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
+            this.deferredActions.unshift({ type: "send", job });
+          }
+          return;
+        }
+        // The send itself threw for another reason — no agent turn was started,
+        // so notifyAgentEnd will never arrive to clear this flag.
         this.sending = false;
         this.processNextDeferred();
       }
+
+      console.error(`Failed to execute job ${job.id}:`, error);
 
       if (job.guaranteed) {
         this.storage.updateJob(job.id, {
@@ -608,6 +651,8 @@ export class CronScheduler {
 
     this.retrying = true;
     this.retryingJobId = jobId;
+    this.currentTurnJobId = jobId;
+    this.currentTurnStartTime = new Date().toISOString();
 
     if (this.contextTailJobId === jobId) {
       // Context ends with this job's error message — use retryLastTurn for a clean replay.
@@ -647,6 +692,73 @@ export class CronScheduler {
     }
   }
 
+  private captureRunRecord(
+    job: CronJob,
+    messages: readonly unknown[],
+    status: "success" | "error",
+    startTime: string | null
+  ): void {
+    const endTime = new Date().toISOString();
+    const record: RunRecord = {
+      jobId: job.id,
+      jobName: job.name,
+      jobPrompt: job.prompt,
+      schedule: job.schedule,
+      jobType: job.type,
+      startTime: startTime ?? endTime,
+      endTime,
+      output: this.extractTurnOutput(messages, job.prompt),
+      status,
+    };
+    this.storage.addRunRecord(record);
+  }
+
+  private extractTurnOutput(messages: readonly unknown[], jobPrompt: string): string {
+    const msgs = messages as Array<Record<string, unknown>>;
+    // Find the last user message containing our scheduled prompt (identifies turn start)
+    let turnStartIdx = -1;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]["role"] === "user") {
+        const c = msgs[i]["content"];
+        const text =
+          typeof c === "string"
+            ? c
+            : Array.isArray(c)
+            ? (c as Array<Record<string, unknown>>)
+                .filter((b) => b["type"] === "text")
+                .map((b) => b["text"] as string)
+                .join("")
+            : "";
+        if (text.includes(jobPrompt)) {
+          turnStartIdx = i;
+          break;
+        }
+      }
+    }
+    // Collect all assistant text blocks after the turn start
+    const parts: string[] = [];
+    const startIdx = turnStartIdx >= 0 ? turnStartIdx + 1 : 0;
+    for (let i = startIdx; i < msgs.length; i++) {
+      const m = msgs[i];
+      if (m["role"] !== "assistant") continue;
+      const c = m["content"];
+      if (typeof c === "string" && c.trim()) {
+        parts.push(c.trim());
+      } else if (Array.isArray(c)) {
+        for (const block of c as Array<Record<string, unknown>>) {
+          if (
+            block["type"] === "text" &&
+            typeof block["text"] === "string" &&
+            (block["text"] as string).trim()
+          ) {
+            parts.push((block["text"] as string).trim());
+          }
+        }
+      }
+    }
+    return parts.join("\n\n");
+  }
+
   private processNextDeferred(): void {
     const action = this.deferredActions.shift();
     if (!action) return;
@@ -659,13 +771,22 @@ export class CronScheduler {
   }
 
   private agentEndHasError(messages: readonly unknown[]): boolean {
-    return messages.some(
-      (m) =>
+    // Only the most recent assistant message reflects this turn's outcome.
+    // Why: scanning the whole history would flag every successful turn as failed
+    // once any earlier turn in the session had errored (e.g. an LLM-not-ready
+    // failure at session start), triggering bogus retries that then call
+    // retryLastTurn() against a successful "stop" message.
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (
         typeof m === "object" &&
         m !== null &&
-        (m as Record<string, unknown>)["role"] === "assistant" &&
-        (m as Record<string, unknown>)["stopReason"] === "error"
-    );
+        (m as Record<string, unknown>)["role"] === "assistant"
+      ) {
+        return (m as Record<string, unknown>)["stopReason"] === "error";
+      }
+    }
+    return false;
   }
 
   private emitChange(event: CronChangeEvent): void {
