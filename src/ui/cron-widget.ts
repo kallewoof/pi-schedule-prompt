@@ -33,7 +33,8 @@ function formatRelativeTime(date: Date | string): string {
   if (days > 0) {
     timeStr = `${days}d`;
   } else if (hours > 0) {
-    timeStr = `${hours}h`;
+    const mins = minutes % 60;
+    timeStr = mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
   } else if (minutes > 0) {
     timeStr = `${minutes}m`;
   } else {

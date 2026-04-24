@@ -12,6 +12,18 @@ export function formatISOLocal(iso: string): string {
   return formatLocalDateTime(new Date(iso));
 }
 
+export function formatRelativeHint(date: Date): string {
+  const diffMs = date.getTime() - Date.now();
+  if (diffMs <= 0) return "";
+  const totalMinutes = Math.floor(diffMs / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours >= 24) return "";
+  if (hours >= 2) return `in ${hours} hours`;
+  if (hours === 1) return minutes > 0 ? `1 hour and ${minutes} minute${minutes === 1 ? "" : "s"}` : "1 hour";
+  return `${totalMinutes} minute${totalMinutes === 1 ? "" : "s"}`;
+}
+
 export function formatSchedule(type: string, schedule: string): string {
   return type === "once" ? formatISOLocal(schedule) : schedule;
 }
