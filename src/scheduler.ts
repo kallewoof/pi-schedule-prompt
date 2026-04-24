@@ -448,6 +448,16 @@ export class CronScheduler {
   }
 
   private async executeJob(job: CronJob): Promise<void> {
+    // Final guard after leadership wait: if agent started while we waited, defer
+    // instead of racing against isStreaming and producing an error.
+    if (this.agentRunning) {
+      this.sending = false;
+      if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
+        this.deferredActions.unshift({ type: "send", job });
+      }
+      return;
+    }
+
     console.log(`Executing scheduled prompt: ${job.name} (${job.id})`);
 
     let sendCompleted = false;
@@ -515,8 +525,17 @@ export class CronScheduler {
       const errMsg = error instanceof Error ? error.message : String(error);
 
       if (!sendCompleted) {
-        // The send itself threw — no agent turn was started, so notifyAgentEnd
-        // will never arrive to clear this flag. Unblock the deferred queue now.
+        // Race: agent became active between our guard and the actual send.
+        // Defer the job so it retries after the current turn ends naturally.
+        if (errMsg.includes("Agent is already processing")) {
+          this.sending = false;
+          if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
+            this.deferredActions.unshift({ type: "send", job });
+          }
+          return;
+        }
+        // The send itself threw for another reason — no agent turn was started,
+        // so notifyAgentEnd will never arrive to clear this flag.
         this.sending = false;
         this.processNextDeferred();
       }
