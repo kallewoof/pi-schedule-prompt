@@ -29,6 +29,21 @@ export class CronScheduler {
    * racing through the gate before the first one registers its in-flight state.
    */
   private sending = false;
+  /** True while any agent turn is in progress (set by notifyAgentStart, cleared by notifyAgentEnd). */
+  private agentRunning = false;
+  /**
+   * Whether the current (or most recent) agent turn was initiated by the scheduler.
+   * Set in notifyAgentStart() based on whether sending=true at that moment.
+   * Defaults to true so that notifyAgentEnd() works correctly when notifyAgentStart()
+   * is not wired up (backward-compatible behaviour).
+   */
+  private currentTurnIsScheduled = true;
+  /**
+   * Fires if agent_end is never received after a send (e.g. suppressed by compaction).
+   * Rescues the stuck sending flag so guaranteed jobs can be retried.
+   */
+  private sendingWatchdog: NodeJS.Timeout | null = null;
+  private readonly SENDING_WATCHDOG_MS = 5 * 60 * 1000;
   /** Tracks which job's prompt is at the tail of the agent context (last sendUserMessage). */
   private contextTailJobId: string | null = null;
 
@@ -92,6 +107,12 @@ export class CronScheduler {
     this.retryingJobId = null;
     this.deferredActions = [];
     this.sending = false;
+    this.agentRunning = false;
+    this.currentTurnIsScheduled = true;
+    if (this.sendingWatchdog !== null) {
+      clearTimeout(this.sendingWatchdog);
+      this.sendingWatchdog = null;
+    }
     this.contextTailJobId = null;
   }
 
@@ -125,12 +146,39 @@ export class CronScheduler {
   }
 
   /**
+   * Called by the host when an agent loop starts (agent_start event).
+   * Tags the turn as scheduler-initiated if a send is currently in-flight.
+   */
+  notifyAgentStart(): void {
+    this.agentRunning = true;
+    // If we sent a message and it hasn't been confirmed yet, this turn belongs to us.
+    this.currentTurnIsScheduled = this.sending;
+    // The turn has started — no longer need the watchdog to rescue a stuck send.
+    if (this.sendingWatchdog !== null) {
+      clearTimeout(this.sendingWatchdog);
+      this.sendingWatchdog = null;
+    }
+  }
+
+  /**
    * Called by the host when an agent turn ends.
-   * Resolves the current retry or the oldest pending guaranteed once-job.
+   * Resolves the current retry or the oldest pending guaranteed once-job,
+   * but only when the turn was scheduler-initiated.
    */
   notifyAgentEnd(messages: readonly unknown[]): void {
-    // Clear the in-flight flag — we're between turns now.
+    this.agentRunning = false;
+    // Capture and reset the turn-ownership flag. Reset to true so that a subsequent
+    // agent_end without a preceding notifyAgentStart (when agent_start is not wired up)
+    // still processes pendingGuaranteedOnce — backward-compatible behaviour.
+    const wasScheduledTurn = this.currentTurnIsScheduled;
+    this.currentTurnIsScheduled = true;
+
+    // Clear the in-flight flag and any outstanding watchdog.
     this.sending = false;
+    if (this.sendingWatchdog !== null) {
+      clearTimeout(this.sendingWatchdog);
+      this.sendingWatchdog = null;
+    }
 
     // If a retryLastTurn()-based retry is in-flight, this agent_end confirms or re-fails it.
     if (this.retrying && this.retryingJobId) {
@@ -155,7 +203,15 @@ export class CronScheduler {
       return;
     }
 
-    // First-time send: confirm or retry the oldest pending guaranteed job.
+    // Only process pendingGuaranteedOnce when this turn was initiated by the scheduler.
+    // A user-initiated turn's agent_end must not accidentally confirm a job whose prompt
+    // the model hasn't actually processed yet.
+    if (!wasScheduledTurn) {
+      this.processNextDeferred();
+      return;
+    }
+
+    // Scheduler-initiated turn: confirm or retry the oldest pending guaranteed job.
     const jobId = this.pendingGuaranteedOnce.shift();
     if (!jobId) {
       this.processNextDeferred();
@@ -371,8 +427,8 @@ export class CronScheduler {
   // --- Execution ---
 
   private async executeJobIfLeader(job: CronJob): Promise<void> {
-    if (this.retrying || this.sending) {
-      // Block new sends while a send or retry is in-flight; queue for after it resolves.
+    if (this.agentRunning || this.retrying || this.sending) {
+      // Block new sends while the agent is active or a send/retry is in-flight.
       if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
         this.deferredActions.push({ type: "send", job });
       }
@@ -406,7 +462,7 @@ export class CronScheduler {
         details: { jobId: job.id, jobName: job.name, prompt: job.prompt },
       });
 
-      this.pi.sendUserMessage(job.prompt, { deliverAs: "followUp" });
+      this.pi.sendUserMessage(job.prompt);
       // Both send calls succeeded — an agent turn is now in flight.
       // sending will be cleared by notifyAgentEnd when the turn completes.
       sendCompleted = true;
@@ -419,6 +475,26 @@ export class CronScheduler {
         // the prompt. For once-jobs this also prevents premature removal from storage.
         this.storage.updateJob(job.id, { lastStatus: "sent" });
         this.pendingGuaranteedOnce.push(job.id);
+
+        // Watchdog: if agent_end is suppressed (e.g. compaction), sending would stay
+        // true forever. Reset after a timeout so guaranteed jobs can be retried.
+        this.sendingWatchdog = setTimeout(() => {
+          this.sendingWatchdog = null;
+          console.warn(`[scheduler] Watchdog: no agent_end after ${this.SENDING_WATCHDOG_MS / 1000}s for job ${job.id} — resetting state`);
+          this.sending = false;
+          this.agentRunning = false;
+          this.currentTurnIsScheduled = true;
+          const stuckJobId = this.pendingGuaranteedOnce.shift();
+          if (stuckJobId) {
+            const current = this.storage.getJob(stuckJobId);
+            if (current && current.enabled && current.guaranteed) {
+              this.storage.updateJob(stuckJobId, { lastStatus: "error" });
+              this.emitChange({ type: "error", jobId: stuckJobId, error: "No response received (retrying in 10m)" });
+              this.scheduleRetryTimer(stuckJobId);
+            }
+          }
+          this.processNextDeferred();
+        }, this.SENDING_WATCHDOG_MS);
       } else if (job.type === "once") {
         this.storage.removeJob(job.id);
         this.emitChange({ type: "remove", jobId: job.id });
@@ -477,7 +553,7 @@ export class CronScheduler {
   private scheduleRetryTimer(jobId: string): void {
     const retry = setTimeout(() => {
       this.retries.delete(jobId);
-      if (this.retrying) {
+      if (this.agentRunning || this.retrying || this.sending) {
         const current = this.storage.getJob(jobId);
         if (current && current.enabled && current.guaranteed) {
           if (!this.deferredActions.some((a) => a.type === "retry" && a.jobId === jobId)) {
@@ -525,7 +601,7 @@ export class CronScheduler {
           display: true,
           details: { jobId: current.id, jobName: current.name, prompt: current.prompt },
         });
-        this.pi.sendUserMessage(current.prompt, { deliverAs: "followUp" });
+        this.pi.sendUserMessage(current.prompt);
         this.contextTailJobId = jobId;
       } catch (error) {
         this.retrying = false;

@@ -467,19 +467,19 @@ describe("sending flag serialises concurrent sends at startup", () => {
 
     // Only the first job should have been sent; B and C are deferred.
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage).toHaveBeenCalledWith("task A", expect.anything());
+    expect(pi.sendUserMessage).toHaveBeenCalledWith("task A");
 
     // agent_end for A → B fires
     scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
     await vi.advanceTimersByTimeAsync(0);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendUserMessage).toHaveBeenLastCalledWith("task B", expect.anything());
+    expect(pi.sendUserMessage).toHaveBeenLastCalledWith("task B");
 
     // agent_end for B → C fires
     scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
     await vi.advanceTimersByTimeAsync(0);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
-    expect(pi.sendUserMessage).toHaveBeenLastCalledWith("task C", expect.anything());
+    expect(pi.sendUserMessage).toHaveBeenLastCalledWith("task C");
   });
 
   it("defers a job that fires while a non-guaranteed send is in-flight", async () => {
@@ -694,5 +694,146 @@ describe("isMissed restart recovery for guaranteed once-jobs", () => {
       guaranteed: false,
     });
     expect(isMissed(scheduler, job)).toBe(true);
+  });
+});
+
+// ---- Bug A regression: agentRunning gate via notifyAgentStart ----
+//
+// When notifyAgentStart() is called (e.g. from a user-initiated turn) the scheduler
+// must defer any jobs that fire during that turn, not send them immediately.
+// notifyAgentStart() exists now as a no-op stub — these tests fail at the *behavioral*
+// assertions because the stub does not yet set any agentRunning flag.
+
+describe("agentRunning gate: notifyAgentStart defers sends while agent is active (Bug A regression)", () => {
+  it("defers a scheduled job fired while agent is running, sends it after the turn ends", async () => {
+    const job = makeJob({ prompt: "scheduled task" });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    // Signal that a turn is already in progress (e.g. user-initiated).
+    scheduler.notifyAgentStart();
+
+    // Scheduler timer fires while the turn is active — must defer, not send immediately.
+    await (scheduler as any).executeJobIfLeader(job);
+
+    // BUG: currently sends immediately because notifyAgentStart() is a no-op.
+    // EXPECTED: no send yet.
+    expect(pi.sendUserMessage).not.toHaveBeenCalled(); // ← FAILS: sendUserMessage WAS called
+
+    // Turn ends — deferred job fires.
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("user-initiated turn's agent_end does not confirm a pending guaranteed job", () => {
+    // notifyAgentStart with sending=false marks the turn as non-scheduler-initiated.
+    // The subsequent agent_end must not consume pendingGuaranteedOnce.
+    const job = makeJob({ guaranteed: true });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    // Inject a pending guaranteed job as if a prior scheduler send is in flight.
+    (scheduler as any).pendingGuaranteedOnce = [job.id];
+    // sending=false at this point — the upcoming turn is user-initiated.
+    scheduler.notifyAgentStart();
+
+    // User turn ends — should NOT confirm the pending guaranteed job.
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+
+    // BUG: currently removes the job because all agent_end calls are treated equally.
+    // EXPECTED: job stays pending.
+    expect(storage.removeJob).not.toHaveBeenCalled(); // ← FAILS: job IS removed
+    expect((scheduler as any).pendingGuaranteedOnce).toEqual([job.id]); // ← FAILS: queue was drained
+  });
+
+  it("scheduler-initiated turn's agent_end does confirm the guaranteed job", async () => {
+    // notifyAgentStart with sending=true marks the turn as scheduler-initiated.
+    // This is the happy-path: the job was sent, agent_start fires, agent_end confirms.
+    const job = makeJob({ guaranteed: true, prompt: "scheduled task" });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    await executeJob(scheduler, job); // sending=true, pendingGuaranteedOnce=[job.id]
+    scheduler.notifyAgentStart();    // sending=true → should tag this as scheduler turn
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+
+    // This already passes today because the stub notifyAgentStart does nothing and
+    // notifyAgentEnd processes pendingGuaranteedOnce unconditionally.
+    // It must still pass after the fix — confirming we haven't broken the happy path.
+    expect(storage.removeJob).toHaveBeenCalledWith(job.id);
+  });
+});
+
+// ---- Bug B regression: watchdog for permanently-stuck sending state ----
+//
+// If agent_end is suppressed (e.g. context compaction), sending stays true forever
+// and guaranteed jobs are never retried. A watchdog timer must rescue this state.
+// These tests use only existing methods; they fail at behavioral assertions.
+
+const WATCHDOG_MS = 5 * 60 * 1000;
+
+describe("watchdog rescues permanently-stuck sending state (Bug B regression)", () => {
+  it("marks guaranteed job as error and retries when agent_end never arrives", async () => {
+    const job = makeJob({ guaranteed: true });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    // Job is sent successfully, but agent_end is never received (compaction suppressed it).
+    await executeJob(scheduler, job);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // Advance past the watchdog window with no agent_end.
+    await vi.advanceTimersByTimeAsync(WATCHDOG_MS);
+
+    // Watchdog must have marked the job as error.
+    expect(storage.updateJob).toHaveBeenCalledWith(
+      job.id,
+      expect.objectContaining({ lastStatus: "error" }),
+    );
+
+    // After the retry delay fires, retryLastTurn() is used (context tail belongs to this job).
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    expect(pi.retryLastTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("deferred jobs can fire after the watchdog resets the stuck sending flag", async () => {
+    const jobA = makeJob({ id: "job-a", guaranteed: true });
+    const jobB = makeJob({ id: "job-b", name: "Job B", prompt: "task B" });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    // jobA sends, gets stuck; jobB fires and is deferred.
+    await (scheduler as any).executeJobIfLeader(jobA);
+    await (scheduler as any).executeJobIfLeader(jobB);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1); // only jobA
+
+    // No agent_end ever arrives — watchdog must eventually unblock jobB.
+    await vi.advanceTimersByTimeAsync(WATCHDOG_MS);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // After the watchdog the sending flag is cleared and jobB fires.
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2); // ← FAILS: jobB never unblocked
+  });
+
+  it("watchdog does not fire when agent_end arrives in time", async () => {
+    const job = makeJob({ guaranteed: true });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    await executeJob(scheduler, job);
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+
+    // Advancing past the watchdog window must not trigger an extra send or error.
+    await vi.advanceTimersByTimeAsync(WATCHDOG_MS + RETRY_MS);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(storage.removeJob).toHaveBeenCalledWith(job.id);
   });
 });
