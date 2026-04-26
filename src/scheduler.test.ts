@@ -343,6 +343,34 @@ describe("guaranteed once-job retry via notifyAgentEnd (model failure path)", ()
     expect(pi.retryLastTurn).not.toHaveBeenCalled();
     expect(storage.removeJob).not.toHaveBeenCalled();
   });
+
+  it("treats the turn as successful when only an OLDER assistant message in history errored", async () => {
+    // Real-world scenario: morning resume → job A fires before LLM is up → assistant errors.
+    // Hours later, LLM is up → job B fires and succeeds. notifyAgentEnd's `messages` argument
+    // is the full session history, so the OLD failed assistant from A is still present along
+    // with B's successful assistant. The scheduler must judge this turn by B's outcome (the
+    // most recent assistant), not flag it as failed because of A's stale error.
+    const job = makeJob({ guaranteed: true });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+
+    const scheduler = makeScheduler(storage, pi);
+    await executeJob(scheduler, job);
+
+    scheduler.notifyAgentEnd([
+      { role: "user", content: "earlier scheduled prompt", timestamp: Date.now() - 60_000 },
+      { role: "assistant", content: [], stopReason: "error", errorMessage: "LLM not ready", timestamp: Date.now() - 60_000 },
+      { role: "user", content: "do the thing", timestamp: Date.now() },
+      { role: "assistant", content: [], stopReason: "stop", timestamp: Date.now() },
+    ]);
+
+    // Current turn ended with stopReason "stop" → confirm success, no retry.
+    expect(storage.removeJob).toHaveBeenCalledWith(job.id);
+    expect(storage.updateJob).not.toHaveBeenCalledWith(job.id, { lastStatus: "error" });
+
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    expect(pi.retryLastTurn).not.toHaveBeenCalled();
+  });
 });
 
 // ---- retrying flag / deferred queue tests ----

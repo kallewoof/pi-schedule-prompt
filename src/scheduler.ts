@@ -650,13 +650,22 @@ export class CronScheduler {
   }
 
   private agentEndHasError(messages: readonly unknown[]): boolean {
-    return messages.some(
-      (m) =>
+    // Only the most recent assistant message reflects this turn's outcome.
+    // Why: scanning the whole history would flag every successful turn as failed
+    // once any earlier turn in the session had errored (e.g. an LLM-not-ready
+    // failure at session start), triggering bogus retries that then call
+    // retryLastTurn() against a successful "stop" message.
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (
         typeof m === "object" &&
         m !== null &&
-        (m as Record<string, unknown>)["role"] === "assistant" &&
-        (m as Record<string, unknown>)["stopReason"] === "error"
-    );
+        (m as Record<string, unknown>)["role"] === "assistant"
+      ) {
+        return (m as Record<string, unknown>)["stopReason"] === "error";
+      }
+    }
+    return false;
   }
 
   private emitChange(event: CronChangeEvent): void {
