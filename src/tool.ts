@@ -131,6 +131,7 @@ export function createCronTool(
               runCount: 0,
               description: params.jobDescription,
               guaranteed: params.guaranteed ?? false,
+              targetContext: (ctx as any)?.context as string | undefined,
             };
 
             storage.addJob(job);

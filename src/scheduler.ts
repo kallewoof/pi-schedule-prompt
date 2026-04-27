@@ -363,15 +363,14 @@ export class CronScheduler {
         this.intervals.set(job.id, interval);
       } else if (job.type === "once") {
         const targetDate = new Date(job.schedule);
-        const delay = targetDate.getTime() - Date.now();
-
-        if (delay > 0) {
-          const timeout = setTimeout(async () => {
-            await this.executeJobIfLeader(job);
-          }, delay);
-          this.intervals.set(job.id, timeout as any);
-        }
-        // Past-time once jobs are handled by isMissed() in start(); nothing to do here.
+        // Clamp to 0 so a schedule that became past-due between tool validation
+        // and here (e.g. storage write latency, clock race) still fires on the
+        // next event-loop tick rather than being silently dropped.
+        const delay = Math.max(0, targetDate.getTime() - Date.now());
+        const timeout = setTimeout(async () => {
+          await this.executeJobIfLeader(job);
+        }, delay);
+        this.intervals.set(job.id, timeout as any);
       } else {
         const cron = new Cron(job.schedule, () => {
           void this.executeJobIfLeader(job);
@@ -465,16 +464,27 @@ export class CronScheduler {
       this.storage.updateJob(job.id, { lastStatus: "running" });
       this.emitChange({ type: "fire", job });
 
-      this.pi.sendMessage({
+      const displayMessage = {
         customType: "scheduled_prompt",
-        content: [{ type: "text", text: job.prompt }],
+        content: [{ type: "text" as const, text: job.prompt }],
         display: true,
         details: { jobId: job.id, jobName: job.name, prompt: job.prompt },
-      });
+      };
+      const wrappedPrompt = `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n${job.prompt}`;
 
-      this.pi.sendUserMessage(
-        `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n${job.prompt}`
-      );
+      const piAny = this.pi as any;
+      const useContext =
+        job.targetContext &&
+        typeof piAny.sendMessageToContext === "function" &&
+        typeof piAny.sendUserMessageToContext === "function";
+
+      if (useContext) {
+        piAny.sendMessageToContext(job.targetContext, displayMessage);
+        piAny.sendUserMessageToContext(job.targetContext, wrappedPrompt);
+      } else {
+        this.pi.sendMessage(displayMessage);
+        this.pi.sendUserMessage(wrappedPrompt);
+      }
       // Both send calls succeeded — an agent turn is now in flight.
       // sending will be cleared by notifyAgentEnd when the turn completes.
       sendCompleted = true;

@@ -866,3 +866,141 @@ describe("watchdog rescues permanently-stuck sending state (Bug B regression)", 
     expect(storage.removeJob).toHaveBeenCalledWith(job.id);
   });
 });
+
+// ─── once-job past-due race at addJob time ────────────────────────────────────
+//
+// Repro for the race the user observed: an agent schedules a prompt very close
+// to "now", the storage write or any other work between tool validation and
+// scheduleJob() pushes Date.now() past the target time, and scheduleJob's
+// `if (delay > 0)` guard then drops the timer silently. The job stays in
+// storage as enabled but no setTimeout is ever registered, so it never fires
+// until a session restart triggers isMissed() recovery.
+
+describe("once-job race: schedule already past at addJob time", () => {
+  it("fires on the next tick when schedule is already past at scheduleJob time (regression)", async () => {
+    const job = makeJob({
+      type: "once",
+      schedule: new Date(Date.now() - 100).toISOString(), // 100ms in the past
+      enabled: true,
+      lastRun: undefined,
+    });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.addJob(job);
+
+    // Timer must have been registered even though schedule is past.
+    expect((scheduler as any).intervals.has(job.id)).toBe(true);
+
+    // Flushing the 0ms timer fires the prompt.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("fires immediately when schedule is past at addJob time (EXPECTED behaviour)", async () => {
+    // What SHOULD happen: scheduler treats a past-due once-job at addJob the
+    // same way start() does — execute it (or schedule a 0ms timer) so the user
+    // doesn't lose the prompt to a clock race.
+    const job = makeJob({
+      type: "once",
+      schedule: new Date(Date.now() - 100).toISOString(),
+      enabled: true,
+      lastRun: undefined,
+    });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.addJob(job);
+
+    // Allow microtasks + any 0ms timer to flush.
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("realistic race: '+0s'-style relative time validated at T, scheduleJob runs at T+ε, still fires (regression)", async () => {
+    // Mirrors the tool flow: parseRelativeTime("+0s") returns ISO of `now`,
+    // storage.addJob writes a JSON file (atomic temp+rename), and by the time
+    // scheduler.addJob → scheduleJob computes `delay = target - Date.now()`
+    // the value is <= 0. The fix clamps delay to 0 so a timer is always created.
+    const targetIso = new Date(Date.now()).toISOString();
+    // Simulate the gap between tool validation and scheduleJob actually running.
+    vi.setSystemTime(Date.now() + 5);
+    const job = makeJob({
+      type: "once",
+      schedule: targetIso,
+      enabled: true,
+      lastRun: undefined,
+    });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.addJob(job);
+
+    expect((scheduler as any).intervals.has(job.id)).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── context-aware routing ─────────────────────────────────────────────────────
+
+describe("context-aware routing", () => {
+  it("calls sendUserMessageToContext and sendMessageToContext when targetContext is set", async () => {
+    const job = makeJob({ targetContext: "+alice" });
+    const storage = makeMockStorage([job]);
+    const pi = {
+      ...makeMockPi(),
+      sendMessageToContext: vi.fn(),
+      sendUserMessageToContext: vi.fn(),
+    };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    await executeJob(scheduler, job);
+
+    expect(pi.sendUserMessageToContext).toHaveBeenCalledWith(
+      "+alice",
+      expect.stringContaining(job.prompt)
+    );
+    expect(pi.sendMessageToContext).toHaveBeenCalledWith(
+      "+alice",
+      expect.objectContaining({ customType: "scheduled_prompt" })
+    );
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("calls sendUserMessage and sendMessage when targetContext is undefined", async () => {
+    const job = makeJob({ targetContext: undefined });
+    const storage = makeMockStorage([job]);
+    const pi = {
+      ...makeMockPi(),
+      sendMessageToContext: vi.fn(),
+      sendUserMessageToContext: vi.fn(),
+    };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    await executeJob(scheduler, job);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessageToContext).not.toHaveBeenCalled();
+    expect(pi.sendMessageToContext).not.toHaveBeenCalled();
+  });
+
+  it("falls back to sendUserMessage when pi lacks sendUserMessageToContext", async () => {
+    const job = makeJob({ targetContext: "+alice" });
+    const storage = makeMockStorage([job]);
+    // pi does NOT have sendUserMessageToContext / sendMessageToContext
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi as any);
+
+    await executeJob(scheduler, job);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+});

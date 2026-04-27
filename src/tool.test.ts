@@ -47,6 +47,17 @@ async function exec(storage: ReturnType<typeof makeStorage>, scheduler: ReturnTy
   return tool.execute("call-id", params, null as any, null as any, makeCtx() as any);
 }
 
+async function execWithContext(
+  storage: ReturnType<typeof makeStorage>,
+  scheduler: ReturnType<typeof makeScheduler>,
+  params: any,
+  ctxContext: string | undefined
+) {
+  const tool = createCronTool(() => storage as any, () => scheduler as any);
+  const ctx = { ...makeCtx(), context: ctxContext };
+  return tool.execute("call-id", params, null as any, null as any, ctx as any);
+}
+
 function makeIntervalJob(overrides: Partial<CronJob> = {}): CronJob {
   return {
     id: "job-1",
@@ -378,5 +389,54 @@ describe("list action – guaranteed display", () => {
 
     const text = result.content.map((c: any) => c.text).join("\n");
     expect(text).toContain("Guaranteed: no");
+  });
+});
+
+// ─── add: targetContext capture ───────────────────────────────────────────────
+
+describe("add action – targetContext capture", () => {
+  it("stores ctx.context as targetContext when context is present", async () => {
+    const storage = makeStorage();
+    const scheduler = makeScheduler();
+
+    await execWithContext(storage, scheduler, {
+      action: "add",
+      schedule: "*/5 * * * * *",
+      prompt: "remind me",
+    }, "+81001234567");
+
+    expect(storage.addJob).toHaveBeenCalledWith(
+      expect.objectContaining({ targetContext: "+81001234567" })
+    );
+  });
+
+  it("stores undefined targetContext when ctx.context is undefined", async () => {
+    const storage = makeStorage();
+    const scheduler = makeScheduler();
+
+    await execWithContext(storage, scheduler, {
+      action: "add",
+      schedule: "*/5 * * * * *",
+      prompt: "remind me",
+    }, undefined);
+
+    expect(storage.addJob).toHaveBeenCalledWith(
+      expect.objectContaining({ targetContext: undefined })
+    );
+  });
+
+  it("stores undefined targetContext when exec is called without ctx (legacy path)", async () => {
+    const storage = makeStorage();
+    const scheduler = makeScheduler();
+
+    await exec(storage, scheduler, {
+      action: "add",
+      schedule: "*/5 * * * * *",
+      prompt: "remind me",
+    });
+
+    expect(storage.addJob).toHaveBeenCalledWith(
+      expect.objectContaining({ targetContext: undefined })
+    );
   });
 });

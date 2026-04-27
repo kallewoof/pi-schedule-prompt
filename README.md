@@ -54,6 +54,19 @@ Get prompted to do something once at a specific time:
 - ✓ **Flexible scheduling**: 6-field cron, intervals (5m, 1h), relative time (+10s), ISO timestamps
 - ✓ **User commands**: `/schedule-prompt` interactive menu with widget visibility toggle
 - ✓ **Safety features**: duplicate name prevention, infinite loop detection, past timestamp handling
+- ✓ **Context-aware routing**: in multi-context RPC mode, jobs fire back into the conversation that created them (e.g. the Signal thread or group)
+
+### Context-aware routing (multi-context RPC mode)
+
+When pi runs in `--mode rpc` with named context sessions (used by bridges like [pi-signal-messenger](https://github.com/kallewoof/pi-signal-messenger) where each Signal thread or group is a separate context), `schedule_prompt` automatically captures `ctx.context` at job-creation time and stores it on the job as `targetContext`.
+
+When the job fires, the scheduler delivers the prompt back into that same context session via `pi.sendUserMessageToContext` / `pi.sendMessageToContext` instead of the default session. This keeps each conversation's scheduled prompts (and their replies) isolated to the thread that requested them.
+
+Falls back to the default session when:
+- The pi runtime does not expose context routing (older versions, non-RPC modes)
+- `ctx.context` is `undefined` (job was created from the main session)
+
+No user action is needed — the routing is transparent.
 
 ## Install
 
