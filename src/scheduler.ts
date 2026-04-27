@@ -50,6 +50,12 @@ export class CronScheduler {
   private currentTurnJobId: string | null = null;
   /** When the current turn's job was fired (ISO timestamp). */
   private currentTurnStartTime: string | null = null;
+  /**
+   * Pending setTimeout(0) handles from processNextDeferred. We defer dequeues to
+   * the next macrotask so they run AFTER pi's finishRun() clears isStreaming —
+   * see processNextDeferred() for details. Tracked so stop() can cancel them.
+   */
+  private deferralTimers = new Set<NodeJS.Timeout>();
 
   private readonly storage: CronStorage;
   private readonly pi: ExtensionAPI;
@@ -106,6 +112,10 @@ export class CronScheduler {
       clearTimeout(retry);
     }
     this.retries.clear();
+    for (const timer of this.deferralTimers) {
+      clearTimeout(timer);
+    }
+    this.deferralTimers.clear();
     this.pendingGuaranteedOnce = [];
     this.retrying = false;
     this.retryingJobId = null;
@@ -411,15 +421,14 @@ export class CronScheduler {
         this.intervals.set(job.id, interval);
       } else if (job.type === "once") {
         const targetDate = new Date(job.schedule);
-        const delay = targetDate.getTime() - Date.now();
-
-        if (delay > 0) {
-          const timeout = setTimeout(async () => {
-            await this.executeJobIfLeader(job);
-          }, delay);
-          this.intervals.set(job.id, timeout as any);
-        }
-        // Past-time once jobs are handled by isMissed() in start(); nothing to do here.
+        // Clamp to 0 so a schedule that became past-due between tool validation
+        // and here (e.g. storage write latency, clock race) still fires on the
+        // next event-loop tick rather than being silently dropped.
+        const delay = Math.max(0, targetDate.getTime() - Date.now());
+        const timeout = setTimeout(async () => {
+          await this.executeJobIfLeader(job);
+        }, delay);
+        this.intervals.set(job.id, timeout as any);
       } else {
         const cron = new Cron(job.schedule, () => {
           void this.executeJobIfLeader(job);
@@ -513,16 +522,27 @@ export class CronScheduler {
       this.storage.updateJob(job.id, { lastStatus: "running" });
       this.emitChange({ type: "fire", job });
 
-      this.pi.sendMessage({
+      const displayMessage = {
         customType: "scheduled_prompt",
-        content: [{ type: "text", text: job.prompt }],
+        content: [{ type: "text" as const, text: job.prompt }],
         display: true,
         details: { jobId: job.id, jobName: job.name, prompt: job.prompt },
-      });
+      };
+      const wrappedPrompt = `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n${job.prompt}`;
 
-      this.pi.sendUserMessage(
-        `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n${job.prompt}`
-      );
+      const piAny = this.pi as any;
+      const useContext =
+        job.targetContext &&
+        typeof piAny.sendMessageToContext === "function" &&
+        typeof piAny.sendUserMessageToContext === "function";
+
+      if (useContext) {
+        piAny.sendMessageToContext(job.targetContext, displayMessage);
+        piAny.sendUserMessageToContext(job.targetContext, wrappedPrompt);
+      } else {
+        this.pi.sendMessage(displayMessage);
+        this.pi.sendUserMessage(wrappedPrompt);
+      }
       // Both send calls succeeded — an agent turn is now in flight.
       // sending will be cleared by notifyAgentEnd when the turn completes.
       sendCompleted = true;
@@ -571,26 +591,17 @@ export class CronScheduler {
         this.emitChange({ type: "fire", job });
       }
     } catch (error) {
+      console.error(`Failed to execute job ${job.id}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
 
       if (!sendCompleted) {
-        // Race: pi's agent was still active despite our guard (agent_end fires before
-        // pi clears its isStreaming flag). Defer silently — notifyAgentEnd will call
-        // processNextDeferred once pi's turn truly ends.
-        if (errMsg.includes("Agent is already processing")) {
-          this.sending = false;
-          if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
-            this.deferredActions.unshift({ type: "send", job });
-          }
-          return;
-        }
-        // The send itself threw for another reason — no agent turn was started,
-        // so notifyAgentEnd will never arrive to clear this flag.
+        // The send threw synchronously (e.g. pi binding missing). Pi-mono's real
+        // sendUserMessage wrapper is fire-and-forget and never throws synchronously,
+        // so this branch only catches setup-time bugs. The agent-busy race is
+        // avoided architecturally in processNextDeferred (setTimeout(0)).
         this.sending = false;
         this.processNextDeferred();
       }
-
-      console.error(`Failed to execute job ${job.id}:`, error);
 
       if (job.guaranteed) {
         this.storage.updateJob(job.id, {
@@ -763,11 +774,22 @@ export class CronScheduler {
     const action = this.deferredActions.shift();
     if (!action) return;
 
-    if (action.type === "send") {
-      void this.executeJobIfLeader(action.job);
-    } else {
-      this.triggerRetry(action.jobId);
-    }
+    // Defer to the next macrotask. processNextDeferred runs from inside our
+    // notifyAgentEnd, which executes WHILE pi is still emitting agent_end —
+    // pi's finishRun() (which clears isStreaming) runs only after the entire
+    // microtask chain unwinds. If we ran the send synchronously through
+    // microtasks, sendUserMessage would race pi's still-true isStreaming flag
+    // and pi would surface the failure as `Extension "<runtime>" error`.
+    // setTimeout(0) puts us in the next macrotask, after finishRun.
+    const timer = setTimeout(() => {
+      this.deferralTimers.delete(timer);
+      if (action.type === "send") {
+        void this.executeJobIfLeader(action.job);
+      } else {
+        this.triggerRetry(action.jobId);
+      }
+    }, 0);
+    this.deferralTimers.add(timer);
   }
 
   private agentEndHasError(messages: readonly unknown[]): boolean {

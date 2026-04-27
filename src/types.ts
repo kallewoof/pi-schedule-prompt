@@ -44,6 +44,8 @@ export interface CronJob {
   description?: string;
   /** If true, run missed jobs immediately on startup; if false (default), drop missed recurring or mark missed one-time as failed */
   guaranteed?: boolean;
+  /** RPC context name to route the fired response to (e.g. Signal thread or group); undefined = main session */
+  targetContext?: string;
 }
 
 /**
