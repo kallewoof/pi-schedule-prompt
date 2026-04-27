@@ -495,19 +495,20 @@ describe("sending flag serialises concurrent sends at startup", () => {
 
     // Only the first job should have been sent; B and C are deferred.
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage).toHaveBeenCalledWith("task A");
+    const prefix = `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n`;
+    expect(pi.sendUserMessage).toHaveBeenCalledWith(`${prefix}task A`);
 
     // agent_end for A → B fires
     scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
     await vi.advanceTimersByTimeAsync(0);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendUserMessage).toHaveBeenLastCalledWith("task B");
+    expect(pi.sendUserMessage).toHaveBeenLastCalledWith(`${prefix}task B`);
 
     // agent_end for B → C fires
     scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
     await vi.advanceTimersByTimeAsync(0);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
-    expect(pi.sendUserMessage).toHaveBeenLastCalledWith("task C");
+    expect(pi.sendUserMessage).toHaveBeenLastCalledWith(`${prefix}task C`);
   });
 
   it("defers a job that fires while a non-guaranteed send is in-flight", async () => {

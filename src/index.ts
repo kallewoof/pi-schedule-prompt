@@ -40,11 +40,25 @@ export default async function (pi: ExtensionAPI) {
     );
   });
 
-  // Register the tool once with getter functions
-  const tool = createCronTool(
-    () => storage,
-    () => scheduler
-  );
+  // Register the tool once with getter functions.
+  // Lazy-init storage/scheduler so the tool works in --mode rpc where session_start never fires.
+  const getStorage = () => {
+    if (!storage) {
+      storage = new CronStorage(process.cwd());
+      storageForVisibility = storage;
+      widgetVisible = storage.getWidgetVisible();
+    }
+    return storage;
+  };
+  const getScheduler = () => {
+    if (!scheduler) {
+      getStorage(); // ensure storage is initialized first
+      scheduler = new CronScheduler(storage, pi);
+      scheduler.start();
+    }
+    return scheduler;
+  };
+  const tool = createCronTool(getStorage, getScheduler);
   pi.registerTool(tool);
 
   // --- Session initialization ---
