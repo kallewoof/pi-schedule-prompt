@@ -49,12 +49,32 @@ export interface CronJob {
 }
 
 /**
+ * Record of a single scheduled job run, persisted for /replay
+ */
+export interface RunRecord {
+  jobId: string;
+  jobName: string;
+  jobPrompt: string;
+  schedule: string;
+  jobType: CronJobType;
+  /** ISO — when executeJob fired the prompt */
+  startTime: string;
+  /** ISO — when agent_end was received */
+  endTime: string;
+  /** Extracted assistant text from the turn */
+  output: string;
+  status: "success" | "error";
+}
+
+/**
  * Persistent storage for cron jobs
  */
 export interface CronStore {
   jobs: CronJob[];
   version: number;
   widgetVisible?: boolean;
+  /** Last 50 run records, newest last */
+  runHistory?: RunRecord[];
 }
 
 /**

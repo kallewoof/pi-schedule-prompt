@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import type { CronJob, CronStore } from "./types.js";
+import type { CronJob, CronStore, RunRecord } from "./types.js";
 
 /**
  * Handles persistence of scheduled prompts to .pi/schedule-prompts.json
@@ -124,6 +124,18 @@ export class CronStorage {
     const store = this.load();
     store.widgetVisible = visible;
     this.save(store);
+  }
+
+  getRunHistory(): RunRecord[] {
+    return this.load().runHistory ?? [];
+  }
+
+  addRunRecord(record: RunRecord): void {
+    const store = this.load();
+    const history = store.runHistory ?? [];
+    history.push(record);
+    if (history.length > 50) history.splice(0, history.length - 50);
+    this.save({ ...store, runHistory: history });
   }
 
   getStorePath(): string {

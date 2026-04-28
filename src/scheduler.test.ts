@@ -34,6 +34,8 @@ function makeMockStorage(initialJobs: CronJob[] = []) {
     getStorePath: vi.fn(() => "/tmp/test-pi/schedule-prompts.json"),
     getWidgetVisible: vi.fn(() => true),
     setWidgetVisible: vi.fn(),
+    getRunHistory: vi.fn(() => []),
+    addRunRecord: vi.fn(),
   };
 }
 
@@ -1002,5 +1004,100 @@ describe("context-aware routing", () => {
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── "Agent is already processing" race — silent deferral regression ──────────
+//
+// Bug: when sendUserMessage throws "Agent is already processing", the scheduler
+// calls console.error BEFORE checking the error type, so pi's extension runtime
+// surfaces it in the UI as "Extension <runtime> error: ...".
+// The race is already handled correctly (job is deferred and retried on the next
+// agent_end), but the premature console.error call makes it look like an
+// unrecoverable failure.
+//
+// Fix: check the error type before deciding to log. If it is the racing-agent
+// error, defer silently — no console.error.
+
+const AGENT_BUSY_MSG =
+  "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
+
+describe('"Agent is already processing" race: defers silently without console.error (regression)', () => {
+  it("does not call console.error when sendUserMessage throws the race error", async () => {
+    const job = makeJob({ prompt: "scheduled task" });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    pi.sendUserMessage.mockImplementationOnce(() => {
+      throw new Error(AGENT_BUSY_MSG);
+    });
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const scheduler = makeScheduler(storage, pi);
+    await executeJob(scheduler, job);
+
+    // BUG: currently calls console.error before checking the error type.
+    // EXPECTED: no console.error — the race is handled silently by deferring.
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+  });
+
+  it("defers the job when sendUserMessage throws the race error, retries on next agent_end", async () => {
+    const job = makeJob({ prompt: "scheduled task" });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    let calls = 0;
+    pi.sendUserMessage.mockImplementation(() => {
+      if (++calls === 1) throw new Error(AGENT_BUSY_MSG);
+    });
+    vi.spyOn(console, "error").mockImplementation(() => {}); // suppress noise
+
+    const scheduler = makeScheduler(storage, pi);
+    await executeJob(scheduler, job);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1); // tried, threw
+    expect((scheduler as any).deferredActions).toHaveLength(1); // queued for retry
+
+    // The agent_end that pi fires for the in-progress turn eventually arrives.
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2); // successfully retried
+  });
+
+  it("reproduces the exact reported sequence: user turn → deferred prompt → race at agent_end → silent retry", async () => {
+    // 1. User turn starts.
+    // 2. Scheduled job fires → deferred (agentRunning=true).
+    // 3. User turn ends → processNextDeferred → sendUserMessage throws the race error.
+    //    Expected: no console.error; job re-deferred.
+    // 4. Pi fires its real final agent_end → deferred job sends successfully.
+    const job = makeJob({ prompt: "scheduled task" });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    let calls = 0;
+    pi.sendUserMessage.mockImplementation(() => {
+      if (++calls === 1) throw new Error(AGENT_BUSY_MSG);
+    });
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const scheduler = makeScheduler(storage, pi);
+
+    // Step 1: user turn in progress.
+    scheduler.notifyAgentStart();
+
+    // Step 2: scheduled job fires while agent is running — must defer.
+    await (scheduler as any).executeJobIfLeader(job);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+
+    // Step 3: user turn ends → deferred job attempts to send → race error.
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    // BUG: console.error is called before the check → visible in pi's UI.
+    // EXPECTED: silent deferral, no console.error.
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+
+    // Step 4: pi's real final agent_end fires → deferred job succeeds.
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 });

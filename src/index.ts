@@ -10,6 +10,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { RunRecord } from "./types.js";
 import { Key } from "@mariozechner/pi-tui";
 import { Container, Text } from "@mariozechner/pi-tui";
 import { CronStorage } from "./storage.js";
@@ -362,6 +363,61 @@ export default async function (pi: ExtensionAPI) {
           break;
         }
       }
+    },
+  });
+
+  // --- Register /replay command ---
+
+  pi.registerCommand("replay", {
+    description: "Replay the output of a past scheduled task run. No arg = last run; integer N = N-th from end; substring = first match by name or prompt.",
+    handler: async (args, ctx) => {
+      const runHistory = getStorage().getRunHistory();
+      if (runHistory.length === 0) {
+        ctx.ui.notify("No run history available yet — runs are recorded as jobs complete.", "info");
+        return;
+      }
+
+      let record: RunRecord | undefined;
+      const arg = args?.trim();
+
+      if (!arg) {
+        record = runHistory[runHistory.length - 1];
+      } else if (/^\d+$/.test(arg)) {
+        const n = parseInt(arg, 10);
+        const idx = runHistory.length - n;
+        record = idx >= 0 ? runHistory[idx] : undefined;
+      } else {
+        const lower = arg.toLowerCase();
+        for (let i = runHistory.length - 1; i >= 0; i--) {
+          const r = runHistory[i];
+          if (r.jobName.toLowerCase().includes(lower) || r.jobPrompt.toLowerCase().includes(lower)) {
+            record = r;
+            break;
+          }
+        }
+      }
+
+      if (!record) {
+        ctx.ui.notify("No matching run found.", "error");
+        return;
+      }
+
+      const start = new Date(record.startTime).toLocaleString();
+      const end   = new Date(record.endTime).toLocaleString();
+      const lines = [
+        `Job:      ${record.jobName}`,
+        `Schedule: ${record.schedule}`,
+        `Prompt:   ${record.jobPrompt}`,
+        `Type:     ${record.jobType}   Status: ${record.status}`,
+        "",
+        "─── Output ──────────────────────────────────────────────────────",
+        record.output || "(no output captured)",
+        "─────────────────────────────────────────────────────────────────",
+        "",
+        `Started: ${start}`,
+        `Ended:   ${end}`,
+      ];
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 }
