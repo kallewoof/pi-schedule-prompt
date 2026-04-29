@@ -845,11 +845,15 @@ describe("watchdog rescues permanently-stuck sending state (Bug B regression)", 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1); // only jobA
 
     // No agent_end ever arrives — watchdog must eventually unblock jobB.
+    // Watchdog setTimeout fires → calls processNextDeferred → schedules setTimeout(0)
+    // for jobB. The inner setTimeout(0) needs a separate non-zero advance: vitest
+    // fake timers won't fire timers scheduled inside another timer's callback when
+    // the follow-up advance is 0ms.
     await vi.advanceTimersByTimeAsync(WATCHDOG_MS);
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1);
 
     // After the watchdog the sending flag is cleared and jobB fires.
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2); // ← FAILS: jobB never unblocked
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
   it("watchdog does not fire when agent_end arrives in time", async () => {
@@ -1007,97 +1011,127 @@ describe("context-aware routing", () => {
   });
 });
 
-// ─── "Agent is already processing" race — silent deferral regression ──────────
+// ─── isStreaming race during agent_end emit ──────────────────────────────────
 //
-// Bug: when sendUserMessage throws "Agent is already processing", the scheduler
-// calls console.error BEFORE checking the error type, so pi's extension runtime
-// surfaces it in the UI as "Extension <runtime> error: ...".
-// The race is already handled correctly (job is deferred and retried on the next
-// agent_end), but the premature console.error call makes it look like an
-// unrecoverable failure.
+// Pi-mono's runtime (agent.ts:520):
+//   `agent_end` only means no further loop events will be emitted. The run is
+//   considered idle later, after all awaited listeners for `agent_end` finish
+//   and `finishRun()` clears runtime-owned state.
 //
-// Fix: check the error type before deciding to log. If it is the racing-agent
-// error, defer silently — no console.error.
+// pi-mono's wrapper (agent-session.ts:2219) is fire-and-forget:
+//   sendUserMessage: (content, options) => {
+//     this.sendUserMessage(content, options).catch((err) =>
+//       runner.emitError({ extensionPath: "<runtime>", ... })
+//     );
+//   }
+//
+// Consequence: when our notifyAgentEnd calls processNextDeferred → executeJobIfLeader
+// → executeJob → sendUserMessage, the *entire microtask chain* unwinds before pi's
+// `finally { finishRun() }` runs. So sendUserMessage is invoked while isStreaming is
+// still true. The wrapper swallows the rejection (our try/catch never sees it) and
+// pi reports it via emitError as `Extension "<runtime>" error: Agent is already
+// processing`.
+//
+// Fix: processNextDeferred wraps the work in setTimeout(0) — a macrotask, which fires
+// after every microtask in pi's agent_end unwind, including finishRun().
 
-const AGENT_BUSY_MSG =
-  "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
-
-describe('"Agent is already processing" race: defers silently without console.error (regression)', () => {
-  it("does not call console.error when sendUserMessage throws the race error", async () => {
-    const job = makeJob({ prompt: "scheduled task" });
-    const storage = makeMockStorage([job]);
+describe("processNextDeferred defers via setTimeout(0) so sends fire AFTER pi's finishRun (race fix)", () => {
+  it("draining only microtasks after notifyAgentEnd does NOT trigger the deferred send — only macrotask advance does", async () => {
+    // This is the empirical exhibit: with the fix, B's send is in the macrotask queue
+    // (where it lands after pi's finishRun has run). Without the fix it would land in
+    // the microtask queue and race against pi's still-true isStreaming flag.
+    const jobA = makeJob({ id: "job-a", prompt: "A" });
+    const jobB = makeJob({ id: "job-b", name: "Job B", prompt: "B" });
+    const storage = makeMockStorage([jobA, jobB]);
     const pi = makeMockPi();
-    pi.sendUserMessage.mockImplementationOnce(() => {
-      throw new Error(AGENT_BUSY_MSG);
-    });
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
     const scheduler = makeScheduler(storage, pi);
-    await executeJob(scheduler, job);
 
-    // BUG: currently calls console.error before checking the error type.
-    // EXPECTED: no console.error — the race is handled silently by deferring.
-    expect(consoleErrorSpy).not.toHaveBeenCalled();
-  });
+    // A and B fire concurrently; A goes immediately, B is deferred.
+    const pA = (scheduler as any).executeJobIfLeader(jobA);
+    const pB = (scheduler as any).executeJobIfLeader(jobB);
+    await Promise.all([pA, pB]);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1); // A only
+    expect((scheduler as any).deferredActions).toHaveLength(1); // B queued
 
-  it("defers the job when sendUserMessage throws the race error, retries on next agent_end", async () => {
-    const job = makeJob({ prompt: "scheduled task" });
-    const storage = makeMockStorage([job]);
-    const pi = makeMockPi();
-    let calls = 0;
-    pi.sendUserMessage.mockImplementation(() => {
-      if (++calls === 1) throw new Error(AGENT_BUSY_MSG);
-    });
-    vi.spyOn(console, "error").mockImplementation(() => {}); // suppress noise
-
-    const scheduler = makeScheduler(storage, pi);
-    await executeJob(scheduler, job);
-
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1); // tried, threw
-    expect((scheduler as any).deferredActions).toHaveLength(1); // queued for retry
-
-    // The agent_end that pi fires for the in-progress turn eventually arrives.
+    // A's turn ends. processNextDeferred fires inside notifyAgentEnd.
     scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
-    await vi.advanceTimersByTimeAsync(0);
 
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2); // successfully retried
-  });
+    // Drain ONLY microtasks — no fake-timer advance.
+    // (`advanceTimersByTimeAsync(0)` would also fire setTimeout(0); we avoid it here
+    //  to distinguish micro- from macrotask scheduling.)
+    for (let i = 0; i < 20; i++) await Promise.resolve();
 
-  it("reproduces the exact reported sequence: user turn → deferred prompt → race at agent_end → silent retry", async () => {
-    // 1. User turn starts.
-    // 2. Scheduled job fires → deferred (agentRunning=true).
-    // 3. User turn ends → processNextDeferred → sendUserMessage throws the race error.
-    //    Expected: no console.error; job re-deferred.
-    // 4. Pi fires its real final agent_end → deferred job sends successfully.
-    const job = makeJob({ prompt: "scheduled task" });
-    const storage = makeMockStorage([job]);
-    const pi = makeMockPi();
-    let calls = 0;
-    pi.sendUserMessage.mockImplementation(() => {
-      if (++calls === 1) throw new Error(AGENT_BUSY_MSG);
-    });
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    const scheduler = makeScheduler(storage, pi);
-
-    // Step 1: user turn in progress.
-    scheduler.notifyAgentStart();
-
-    // Step 2: scheduled job fires while agent is running — must defer.
-    await (scheduler as any).executeJobIfLeader(job);
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
-
-    // Step 3: user turn ends → deferred job attempts to send → race error.
-    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
-    await vi.advanceTimersByTimeAsync(0);
+    // With the fix: B is queued as a macrotask, NOT yet fired.
+    // Without the fix: B would have fired through the microtask chain.
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    // BUG: console.error is called before the check → visible in pi's UI.
-    // EXPECTED: silent deferral, no console.error.
-    expect(consoleErrorSpy).not.toHaveBeenCalled();
 
-    // Step 4: pi's real final agent_end fires → deferred job succeeds.
-    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    // Advance fake timers by 0 → setTimeout(0) callback fires → B is sent.
     await vi.advanceTimersByTimeAsync(0);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("stop() cancels pending deferral timers", async () => {
+    const jobA = makeJob({ id: "job-a", prompt: "A" });
+    const jobB = makeJob({ id: "job-b", name: "Job B", prompt: "B" });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    const pA = (scheduler as any).executeJobIfLeader(jobA);
+    const pB = (scheduler as any).executeJobIfLeader(jobB);
+    await Promise.all([pA, pB]);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // notifyAgentEnd schedules B's send via setTimeout(0).
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+
+    // Stop the scheduler before the macrotask fires.
+    scheduler.stop();
+
+    // Advancing timers must NOT trigger the deferred send.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Realistic-mock test: the catch block's race handler was dead code ────────
+//
+// The previous "Agent is already processing" handler in executeJob's catch block
+// was unreachable from real pi. pi-mono's wrapper is fire-and-forget — the rejection
+// is swallowed inside the wrapper's `.catch`, so no exception ever propagates to our
+// try/catch. The handler that pushed jobs back to deferredActions on
+// `errMsg.includes("Agent is already processing")` could never run.
+//
+// Earlier tests created the false impression of coverage by mocking sendUserMessage
+// to *synchronously throw* — a behavior pi-mono's wrapper does not exhibit. This
+// test uses a realistic mock and verifies the catch's recovery path is NOT taken.
+
+describe("realistic pi behavior: sendUserMessage wrapper is fire-and-forget", () => {
+  it("the catch block does not fire when the wrapper returns void (which is real pi behavior)", async () => {
+    const job = makeJob({ guaranteed: true, prompt: "task" });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+
+    // Realistic mock: returns void synchronously, never throws.
+    // (Mirrors agent-session.ts:2219, which fires the underlying call and routes
+    //  rejections to runner.emitError — never up the call stack.)
+    pi.sendUserMessage.mockImplementation(() => undefined);
+    pi.sendMessage.mockImplementation(() => undefined);
+
+    const scheduler = makeScheduler(storage, pi);
+    await executeJob(scheduler, job);
+
+    // Try block completed: success-path side effects fired.
+    expect((scheduler as any).pendingGuaranteedOnce).toEqual([job.id]);
+    expect(storage.updateJob).toHaveBeenCalledWith(job.id, { lastStatus: "sent" });
+
+    // Catch-block-only side effects did NOT fire:
+    //   - The race handler would have unshifted job into deferredActions.
+    //   - The fall-through error path would have set lastStatus: "error".
+    expect((scheduler as any).deferredActions).toHaveLength(0);
+    expect(storage.updateJob).not.toHaveBeenCalledWith(
+      job.id,
+      expect.objectContaining({ lastStatus: "error" }),
+    );
   });
 });
