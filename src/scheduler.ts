@@ -1,11 +1,64 @@
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { Cron } from "croner";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import type { CronJob, CronChangeEvent, RunRecord } from "./types.js";
+import type { CronJob, CronChangeEvent, RunRecord, SessionShutdownReason } from "./types.js";
 import type { CronStorage } from "./storage.js";
 
 const GUARANTEED_RETRY_DELAY_MS = 10 * 60 * 1000;
+const DEDICATED_JOB_TIMEOUT_MS = 20 * 60 * 1000;
+const DEDICATED_JOB_TIMEOUT_MIN = DEDICATED_JOB_TIMEOUT_MS / 60_000;
+
+/**
+ * Segregated session dir for dedicated subprocesses. Keeps them out of the
+ * default `~/.pi/agent/sessions/<cwd>/` selector while still leaving a session
+ * file on disk for post-mortem inspection if a dedicated run crashes.
+ */
+const DEDICATED_SESSION_DIR = path.join(os.homedir(), ".pi", "agent", "schedule-prompt-sessions");
+
+/**
+ * Module-scope tracking of in-flight dedicated subprocesses. Lives across
+ * scheduler instances because session replacement (`/new`, `/fork`, `/resume`,
+ * `/reload`) discards the old CronScheduler and constructs a new one — but the
+ * subprocess started by the old scheduler is intentionally kept alive (see
+ * `stop({ reason })`). Centralising here lets the new scheduler:
+ *   - skip firing a job that's already running in the prior instance's promise,
+ *   - report `runJobNow` as `"queued"` for such jobs,
+ *   - inherit user-requested retry intents queued before the swap.
+ *
+ * The map carries enough metadata for `/schedule-prompt ps` to render the
+ * activity even when the originating scheduler instance is gone.
+ *
+ * The maps are cleared only on `stop({ reason: "quit" })` (host process is
+ * exiting) — at which point the abort signals are also fired.
+ */
+interface InFlightEntry {
+  controller: AbortController;
+  jobId: string;
+  jobName: string;
+  prompt: string;
+  /** ISO timestamp of when the subprocess was launched. */
+  startTime: string;
+}
+const inFlightDedicated = new Map<string, InFlightEntry>();
+const pendingDedicatedRetriesGlobal = new Set<string>();
+
+/** Snapshot of dedicated-job activity for `/schedule-prompt ps`. */
+export interface DedicatedActivity {
+  inFlight: ReadonlyArray<{ jobId: string; jobName: string; prompt: string; startTime: string }>;
+  queuedRetries: ReadonlyArray<string>;
+}
+
+export function getDedicatedActivity(): DedicatedActivity {
+  const inFlight = Array.from(inFlightDedicated.values()).map((e) => ({
+    jobId: e.jobId,
+    jobName: e.jobName,
+    prompt: e.prompt,
+    startTime: e.startTime,
+  }));
+  return { inFlight, queuedRetries: Array.from(pendingDedicatedRetriesGlobal) };
+}
 
 type DeferredAction = { type: "send"; job: CronJob } | { type: "retry"; jobId: string };
 
@@ -57,6 +110,15 @@ export class CronScheduler {
    */
   private deferralTimers = new Set<NodeJS.Timeout>();
 
+  /**
+   * True after stop(). Async work (e.g. an executeDedicatedJob that was past
+   * `await pi.exec(...)` when /new fired) may still try to send notifications
+   * after the captured `pi` has been invalidated by pi-mono's
+   * `_extensionRunner.invalidate()`. Treat any send-after-stop as a no-op so
+   * the trailing notify doesn't throw a stale-ctx error into the new session.
+   */
+  private stopped = false;
+
   private readonly storage: CronStorage;
   private readonly pi: ExtensionAPI;
   private readonly leaderPidPath: string;
@@ -68,17 +130,38 @@ export class CronScheduler {
   }
 
   start(): void {
+    this.stopped = false;
     const allJobs = this.storage.getAllJobs();
     const now = new Date();
 
     for (const job of allJobs) {
       if (!job.enabled) continue;
 
+      // Don't double-fire a dedicated job whose subprocess survived a session
+      // swap and is still running in a prior scheduler instance's promise.
+      // The natural cron tick (or its own pendingDedicatedRetriesGlobal hook)
+      // will handle re-firing once that subprocess finishes.
+      if (job.dedicatedContext && inFlightDedicated.has(job.id)) {
+        if (job.type !== "once") this.scheduleJob(job);
+        continue;
+      }
+
       if (this.isMissed(job, now)) {
         if (job.guaranteed) {
-          void this.executeJobIfLeader(job);
-          if (job.type !== "once") {
-            this.scheduleJob(job);
+          // If the previous attempt errored or was sent-but-unconfirmed, route through
+          // the retry timer rather than firing immediately on session_start. This prevents
+          // every failed dedicated job from re-launching in parallel each /new, which can
+          // overwhelm the model API and produce more failures.
+          if (job.lastStatus === "error" || job.lastStatus === "sent") {
+            this.scheduleRetryTimer(job.id);
+            if (job.type !== "once") {
+              this.scheduleJob(job);
+            }
+          } else {
+            void this.executeJobIfLeader(job);
+            if (job.type !== "once") {
+              this.scheduleJob(job);
+            }
           }
         } else if (job.type === "once") {
           this.storage.updateJob(job.id, {
@@ -97,7 +180,21 @@ export class CronScheduler {
     }
   }
 
-  stop(): void {
+  /**
+   * Tear down scheduling state.
+   *
+   * `reason` differentiates host-process exit (`"quit"`) from session
+   * replacement (anything else: `"new" | "fork" | "resume" | "reload"`). On
+   * session replacement the host process keeps running and any dedicated
+   * subprocesses are intentionally left alive — their work is already
+   * underway and aborting them defeats the entire purpose of dedicated
+   * context. Only on `"quit"` (or no reason given, for backwards compat) do
+   * we abort in-flight controllers and clear the module-scope registries.
+   */
+  stop(opts?: { reason?: SessionShutdownReason }): void {
+    const fullTeardown = !opts?.reason || opts.reason === "quit";
+
+    this.stopped = true;
     for (const cron of this.jobs.values()) {
       cron.stop();
     }
@@ -130,6 +227,20 @@ export class CronScheduler {
     this.contextTailJobId = null;
     this.currentTurnJobId = null;
     this.currentTurnStartTime = null;
+
+    if (fullTeardown) {
+      // Host process is exiting — abort every in-flight dedicated subprocess
+      // so we don't leave orphan PIDs behind, and clear module-scope state
+      // since no scheduler will be left alive to reconcile it.
+      for (const entry of inFlightDedicated.values()) {
+        entry.controller.abort();
+      }
+      inFlightDedicated.clear();
+      pendingDedicatedRetriesGlobal.clear();
+    }
+    // On session-replace: leave inFlightDedicated and pendingDedicatedRetriesGlobal
+    // alone so the old subprocess can run to completion and any user-queued
+    // retry survives the swap.
   }
 
   addJob(job: CronJob): void {
@@ -253,7 +364,7 @@ export class CronScheduler {
     // Scheduler-initiated turn: confirm or retry the oldest pending guaranteed job.
     const jobId = this.pendingGuaranteedOnce.shift();
     if (!jobId) {
-      // Non-guaranteed recurring job: capture output for /replay
+      // Non-guaranteed recurring job: capture output for /schedule-prompt replay
       if (turnJobId) {
         const job = this.storage.getJob(turnJobId);
         if (job) this.captureRunRecord(job, messages, "success", turnStartTime);
@@ -445,6 +556,46 @@ export class CronScheduler {
     }
   }
 
+  /**
+   * Reconcile in-memory timers against persisted storage.
+   *
+   * Called after a dedicated subprocess exits: that child runs in its own
+   * pi process with its own scheduler instance, so when it calls
+   * `schedule_prompt` to add/remove jobs the host scheduler sees nothing —
+   * the disk file is updated but no timer is (un)registered here.
+   *
+   * Strategy: read storage, add timers for any enabled jobs missing one,
+   * drop timers whose job vanished or was disabled. Schedule changes are
+   * not detected (would require comparing fields); users can `remove + add`
+   * if that becomes necessary.
+   */
+  private resyncTimersFromStorage(): void {
+    const diskJobs = this.storage.getAllJobs();
+    const diskIds = new Set(diskJobs.map((j) => j.id));
+
+    for (const job of diskJobs) {
+      // A retry timer (`this.retries`) means the scheduler is already
+      // managing this job through the guaranteed-retry path; adding a
+      // normal timer would double-fire after the retry interval.
+      if (this.retries.has(job.id)) continue;
+      const hasTimer = this.jobs.has(job.id) || this.intervals.has(job.id);
+      if (job.enabled && !hasTimer) {
+        this.scheduleJob(job);
+        this.emitChange({ type: "add", job });
+      } else if (!job.enabled && hasTimer) {
+        this.unscheduleJob(job.id);
+      }
+    }
+
+    const timerIds = new Set<string>([...this.jobs.keys(), ...this.intervals.keys()]);
+    for (const id of timerIds) {
+      if (!diskIds.has(id)) {
+        this.unscheduleJob(id);
+        this.emitChange({ type: "remove", jobId: id });
+      }
+    }
+  }
+
   private unscheduleJob(id: string): void {
     const cron = this.jobs.get(id);
     if (cron) {
@@ -483,7 +634,40 @@ export class CronScheduler {
 
   // --- Execution ---
 
+  /**
+   * Fire a job immediately, regardless of its `enabled` flag.
+   * Routes through the same dispatch as automatic firing (`executeJobIfLeader`),
+   * so dedicated jobs run in a subprocess and main-session jobs go through the
+   * agentRunning/sending gate. Used by the `/schedule-prompt retry` command.
+   *
+   * Returns the disposition so callers can show appropriate UI:
+   *   - "fired"   — the job started executing now (or is in the dispatch path)
+   *   - "queued"  — the job is currently in-flight (dedicated subprocess running);
+   *                 a retry will fire automatically when the current run finishes
+   *
+   * @throws if no job with the given id exists in storage.
+   */
+  async runJobNow(jobId: string): Promise<"fired" | "queued"> {
+    const job = this.storage.getJob(jobId);
+    if (!job) throw new Error(`Job ${jobId} not found`);
+    if (job.dedicatedContext && inFlightDedicated.has(jobId)) {
+      // The current subprocess (which may have been started by a prior scheduler
+      // instance, before /new) will see this flag in its completion path and
+      // re-fire itself once it finishes. Avoids silently no-op'ing the user's
+      // explicit retry while the job is busy.
+      pendingDedicatedRetriesGlobal.add(jobId);
+      return "queued";
+    }
+    await this.executeJobIfLeader(job);
+    return "fired";
+  }
+
   private async executeJobIfLeader(job: CronJob): Promise<void> {
+    if (job.dedicatedContext) {
+      // Runs in an isolated subprocess — does not block the main agent.
+      void this.executeDedicatedJob(job);
+      return;
+    }
     if (this.agentRunning || this.retrying || this.sending) {
       // Block new sends while the agent is active or a send/retry is in-flight.
       if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
@@ -635,6 +819,17 @@ export class CronScheduler {
    * in which case the job is deferred until the active retry resolves.
    */
   private scheduleRetryTimer(jobId: string): void {
+    // Cancel any pending retry for this job before creating a new one.
+    // Without this, scheduleRetryTimer being called twice (e.g. once from start()
+    // for an error-state job and again after a fresh failure of the same job)
+    // would leave both timers active. Both fire in succession — the first triggers
+    // a retry, and the second fires shortly after, kicking off another retry as
+    // soon as the first's inFlightDedicated guard clears. Net effect: the user
+    // sees back-to-back duplicate runs of the same scheduled prompt.
+    const existing = this.retries.get(jobId);
+    if (existing) {
+      clearTimeout(existing);
+    }
     const retry = setTimeout(() => {
       this.retries.delete(jobId);
       if (this.agentRunning || this.retrying || this.sending) {
@@ -659,6 +854,11 @@ export class CronScheduler {
   private triggerRetry(jobId: string): void {
     const current = this.storage.getJob(jobId);
     if (!current || !current.enabled || !current.guaranteed) return;
+
+    if (current.dedicatedContext) {
+      void this.executeDedicatedJob(current);
+      return;
+    }
 
     this.retrying = true;
     this.retryingJobId = jobId;
@@ -701,6 +901,202 @@ export class CronScheduler {
         this.scheduleRetryTimer(jobId);
       }
     }
+  }
+
+  private async executeDedicatedJob(job: CronJob): Promise<void> {
+    // Cross-instance dedup: if a prior scheduler already has this job in
+    // flight (e.g. survived a /new), don't fire a duplicate subprocess.
+    if (inFlightDedicated.has(job.id)) return;
+
+    const startTime = new Date().toISOString();
+    const controller = new AbortController();
+    inFlightDedicated.set(job.id, {
+      controller,
+      jobId: job.id,
+      jobName: job.name,
+      prompt: job.prompt,
+      startTime,
+    });
+
+    const piAny = this.pi as any;
+    const notifyToContext =
+      job.targetContext &&
+      typeof piAny.sendMessageToContext === "function";
+
+    // CRITICAL: dedicated-job begin/end notifications must NEVER feed the running
+    // agent. pi-mono's sendCustomMessage defaults to `agent.steer(message)` when
+    // the agent is streaming, which queues the message as a prompt for the next
+    // assistant turn. If the message body contains the dedicated prompt text,
+    // the main agent will pick it up and start executing the dedicated job's
+    // task itself — defeating the entire point of dedicated context. We:
+    //   1) keep the prompt out of `content[0].text` (renderer uses details.prompt)
+    //   2) pass `deliverAs: "nextTurn"` ONLY when the agent is actively streaming,
+    //      so the notification doesn't steer the active turn. When the session is
+    //      idle, omit deliverAs so pi-mono renders the message immediately via
+    //      message_start/message_end — otherwise nextTurn-queued notifications sit
+    //      invisibly in _pendingNextTurnMessages until the user submits another
+    //      prompt, which is why an end notification appeared to never arrive when
+    //      a dedicated job finished during an idle session.
+    const notify = (customType: string, text: string, details: Record<string, unknown>) => {
+      // If the scheduler was stopped (e.g. by session_shutdown during /new) while
+      // a dedicated subprocess was past `await pi.exec(...)`, the captured `pi`
+      // has been invalidated by pi-mono and sendMessage would throw a stale-ctx
+      // error. The new session shouldn't receive notifications about the prior
+      // session's runs anyway, so drop them.
+      if (this.stopped) return;
+      const msg = {
+        customType,
+        content: [{ type: "text" as const, text }],
+        display: true,
+        details,
+      };
+      const opts = this.agentRunning ? { deliverAs: "nextTurn" as const } : {};
+      try {
+        if (notifyToContext) {
+          piAny.sendMessageToContext(job.targetContext, msg, opts);
+        } else {
+          this.pi.sendMessage(msg, opts);
+        }
+      } catch (err) {
+        // Defense in depth: if the ctx went stale between the `stopped` check
+        // and the send (or pi-mono invalidates without firing session_shutdown
+        // first), don't propagate — it would surface as an uncaught exception
+        // from the cron tick.
+        const message = err instanceof Error ? err.message : String(err);
+        if (!/stale after session replacement|extension ctx is stale/i.test(message)) {
+          throw err;
+        }
+      }
+    };
+
+    notify(
+      "scheduled_prompt_begin",
+      `[Scheduled Prompt] dedicated subprocess begin: ${job.name}`,
+      { jobId: job.id, jobName: job.name, prompt: job.prompt, startTime: startTime }
+    );
+
+    this.storage.updateJob(job.id, { lastStatus: "running" });
+    this.emitChange({ type: "fire", job });
+
+    const wrappedPrompt =
+      `This is an automated scheduled prompt. Interpret and execute the following directly — ` +
+      `phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n${job.prompt}`;
+
+    let status: "success" | "error" = "success";
+    let output = "";
+    const startMs = Date.now();
+
+    try {
+      const result = await this.pi.exec(
+        "pi",
+        [
+          "--mode", "json",
+          "-p",
+          "--session-dir", DEDICATED_SESSION_DIR,
+          wrappedPrompt,
+        ],
+        { signal: controller.signal, timeout: DEDICATED_JOB_TIMEOUT_MS }
+      );
+      const durationS = Math.round((Date.now() - startMs) / 1000);
+      const formatted = formatDedicatedRunOutput(result.stdout, result.stderr, result.code, result.killed, durationS);
+      output = formatted.output;
+      // A successful pi --mode json run always emits an agent_end event with at least one
+      // assistant message containing text. If we didn't see that, treat as failure even
+      // when the exit code is 0 (timeout-killed processes resolve with code 0 sometimes).
+      status = result.code === 0 && !result.killed && formatted.hasAgentEnd ? "success" : "error";
+    } catch (error) {
+      if ((error as Error & { name?: string }).name === "AbortError") {
+        // Scheduler was stopped on host quit — exit without updating storage
+        inFlightDedicated.delete(job.id);
+        return;
+      }
+      const durationS = Math.round((Date.now() - startMs) / 1000);
+      const errMsg = error instanceof Error ? error.message : String(error);
+      output = `[exit=? killed=? duration=${durationS}s]\n[error]\n${errMsg}`;
+      status = "error";
+    } finally {
+      inFlightDedicated.delete(job.id);
+    }
+
+    this.captureRunRecordFromOutput(job, output, status, startTime);
+
+    if (job.type === "once") {
+      if (status === "success" || !job.guaranteed) {
+        this.storage.removeJob(job.id);
+        this.emitChange({ type: "remove", jobId: job.id });
+      } else {
+        this.storage.updateJob(job.id, { lastStatus: "error" });
+        this.emitChange({ type: "error", jobId: job.id, error: "Subprocess error (retrying in 10m)" });
+        this.scheduleRetryTimer(job.id);
+      }
+    } else {
+      const nextRun = this.getNextRun(job.id);
+      this.storage.updateJob(job.id, {
+        lastRun: new Date().toISOString(),
+        lastStatus: status,
+        runCount: job.runCount + 1,
+        nextRun: nextRun?.toISOString(),
+      });
+      this.emitChange({ type: "fire", job });
+      // Recurring guaranteed jobs that fail need a retry timer too — without this,
+      // a failed daily/hourly job has no recovery path until its next natural cron tick.
+      if (status === "error" && job.guaranteed) {
+        this.scheduleRetryTimer(job.id);
+      }
+    }
+
+    // The dedicated child may have added/removed jobs via schedule_prompt;
+    // those writes hit storage but not this scheduler. Reconcile timers now
+    // so any new jobs actually fire and any removed ones stop holding state.
+    this.resyncTimersFromStorage();
+
+    const hint = status === "error" ? detectFailureHint(output) : null;
+    const endText = hint
+      ? `[Scheduled Prompt] Processing ended (failed). See /schedule-prompt replay ${job.id} to review.\n⚠️ Likely cause: ${hint}`
+      : `[Scheduled Prompt] Processing ended. See /schedule-prompt replay ${job.id} to review.`;
+    notify(
+      "scheduled_prompt_end",
+      endText,
+      {
+        jobId: job.id,
+        jobName: job.name,
+        failureHint: hint ?? undefined,
+        startTime,
+        endTime: new Date().toISOString(),
+      }
+    );
+
+    // If the user (or a parallel code path) requested a manual retry while this
+    // run was in flight, fire it now. The retry intent is module-scoped so it
+    // survives a session swap that happened while the run was hanging. Prefer
+    // the latest version from storage (in case the prompt/schedule was edited
+    // mid-run); fall back to the in-memory snapshot, since once-jobs are
+    // removed from storage on success.
+    if (pendingDedicatedRetriesGlobal.has(job.id)) {
+      pendingDedicatedRetriesGlobal.delete(job.id);
+      const fresh = this.storage.getJob(job.id) ?? job;
+      void this.executeDedicatedJob(fresh);
+    }
+  }
+
+  private captureRunRecordFromOutput(
+    job: CronJob,
+    output: string,
+    status: "success" | "error",
+    startTime: string | null
+  ): void {
+    const endTime = new Date().toISOString();
+    this.storage.addRunRecord({
+      jobId: job.id,
+      jobName: job.name,
+      jobPrompt: job.prompt,
+      schedule: job.schedule,
+      jobType: job.type,
+      startTime: startTime ?? endTime,
+      endTime,
+      output,
+      status,
+    });
   }
 
   private captureRunRecord(
@@ -746,28 +1142,10 @@ export class CronScheduler {
         }
       }
     }
-    // Collect all assistant text blocks after the turn start
-    const parts: string[] = [];
+    // Render every message after the turn start: thinking, text, tool calls, tool results.
     const startIdx = turnStartIdx >= 0 ? turnStartIdx + 1 : 0;
-    for (let i = startIdx; i < msgs.length; i++) {
-      const m = msgs[i];
-      if (m["role"] !== "assistant") continue;
-      const c = m["content"];
-      if (typeof c === "string" && c.trim()) {
-        parts.push(c.trim());
-      } else if (Array.isArray(c)) {
-        for (const block of c as Array<Record<string, unknown>>) {
-          if (
-            block["type"] === "text" &&
-            typeof block["text"] === "string" &&
-            (block["text"] as string).trim()
-          ) {
-            parts.push((block["text"] as string).trim());
-          }
-        }
-      }
-    }
-    return parts.join("\n\n");
+    const slice = msgs.slice(startIdx);
+    return renderMessages(slice);
   }
 
   private processNextDeferred(): void {
@@ -870,4 +1248,202 @@ export class CronScheduler {
 
     return value * multipliers[unit];
   }
+}
+
+/**
+ * Format a dedicated subprocess run for storage as `RunRecord.output`.
+ * Always emits a diagnostic header so empty/timeout runs aren't blank.
+ * Parses `pi --mode json` JSONL stdout to render thinking, tool calls, and tool results.
+ */
+export function formatDedicatedRunOutput(
+  stdout: string,
+  stderr: string,
+  code: number,
+  killed: boolean,
+  durationS: number
+): { output: string; hasAgentEnd: boolean } {
+  const header = `[exit=${code} killed=${killed} duration=${durationS}s]`;
+  const events: Array<Record<string, unknown>> = [];
+  let hasAgentEnd = false;
+
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const event = JSON.parse(trimmed) as Record<string, unknown>;
+      events.push(event);
+      if (event["type"] === "agent_end") hasAgentEnd = true;
+    } catch {
+      // Non-JSON line — likely a startup banner or error; ignored for rendering.
+    }
+  }
+
+  const sections: string[] = [header];
+
+  // Prefer the agent_end snapshot (full messages array) when present.
+  let messagesToRender: ReadonlyArray<Record<string, unknown>> | null = null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i];
+    if (ev["type"] === "agent_end" && Array.isArray(ev["messages"])) {
+      messagesToRender = ev["messages"] as Array<Record<string, unknown>>;
+      break;
+    }
+  }
+
+  // Fall back to reconstructing message state from message_*/turn_end events
+  // when the stream was cut off before agent_end (e.g. timeout kill).
+  //
+  // CRITICAL: each streaming `message_update` event carries a snapshot of the
+  // *same* logical message with growing content. Naively pushing every event's
+  // `message` produces N copies of the same logical message, each rendered
+  // separately. A single timed-out run with 5000+ thinking deltas produced 27 MB
+  // of duplicated `[thinking]` blocks before this dedup. We collapse runs of
+  // updates per logical message into a single final state.
+  if (!messagesToRender) {
+    const closedMessages: Array<Record<string, unknown>> = [];
+    let openMessage: Record<string, unknown> | null = null;
+    for (const ev of events) {
+      const t = ev["type"];
+      if (t === "message_start") {
+        if (openMessage) closedMessages.push(openMessage);
+        openMessage = (ev["message"] as Record<string, unknown> | undefined) ?? null;
+      } else if (t === "message_update") {
+        const m = ev["message"] as Record<string, unknown> | undefined;
+        if (m) openMessage = m; // replace with latest snapshot of the same message
+      } else if (t === "message_end") {
+        const m = ev["message"] as Record<string, unknown> | undefined;
+        if (m) closedMessages.push(m);
+        else if (openMessage) closedMessages.push(openMessage);
+        openMessage = null;
+      } else if (t === "turn_end") {
+        // turn_end carries the assistant message + toolResults; useful when
+        // individual message_end events were dropped.
+        const m = ev["message"] as Record<string, unknown> | undefined;
+        if (m && !closedMessages.includes(m)) closedMessages.push(m);
+        const toolResults = ev["toolResults"];
+        if (Array.isArray(toolResults)) {
+          for (const tr of toolResults as Array<Record<string, unknown>>) {
+            closedMessages.push(tr);
+          }
+        }
+      }
+    }
+    if (openMessage) closedMessages.push(openMessage);
+    if (closedMessages.length > 0) messagesToRender = closedMessages;
+  }
+
+  if (messagesToRender && messagesToRender.length > 0) {
+    const rendered = renderMessages(messagesToRender);
+    if (rendered) sections.push(rendered);
+  } else if (stdout.trim().length > 0 && events.length === 0) {
+    // No JSON parsed at all — store raw stdout (legacy `pi -p` mode or unexpected output).
+    sections.push(stdout.trim());
+  }
+
+  if (stderr.trim().length > 0) {
+    sections.push(`[stderr]\n${stderr.trim()}`);
+  }
+
+  let output = sections.join("\n\n");
+  // Cap at 64 KB to keep storage bounded. Without this, a runaway agent that
+  // emits multi-MB thinking blocks per run plus retained records can balloon
+  // the storage file to hundreds of MB.
+  const MAX_OUTPUT_BYTES = 64 * 1024;
+  if (output.length > MAX_OUTPUT_BYTES) {
+    const head = output.slice(0, MAX_OUTPUT_BYTES);
+    output = `${head}\n\n[output truncated; full size = ${output.length} bytes]`;
+  }
+  return { output, hasAgentEnd };
+}
+
+/**
+ * Inspect a rendered run output for known failure signatures and return a short
+ * actionable hint describing the likely cause. Returns null if no match.
+ *
+ * Patterns target the things that have actually broken dedicated runs in practice:
+ * pi-guardrails path-access blocks (often the bash tool tries to write to /tmp for
+ * truncated output and the non-interactive subprocess can't answer the prompt),
+ * read-only filesystems, model/connection errors, and unrecognized agent stalls.
+ */
+export function detectFailureHint(output: string): string | null {
+  // pi-guardrails path-access denial. Two flavours: explicit "no UI to confirm"
+  // (mode=ask in a non-interactive subprocess) and the generic block string.
+  const noUiMatch = output.match(/Access to ([^\s]+) is blocked \(outside working directory, no UI to confirm\)/);
+  if (noUiMatch) {
+    return `pi-guardrails blocked access to ${noUiMatch[1]} (no UI to confirm in dedicated subprocess). Add the path to \`pathAccess.allowedPaths\` in ~/.pi/agent/extensions/guardrails.json.`;
+  }
+  const blockedMatch = output.match(/Access to ([^\s]+) is blocked \(outside working directory\)/);
+  if (blockedMatch) {
+    return `pi-guardrails blocked access to ${blockedMatch[1]}. Add the path to \`pathAccess.allowedPaths\` in ~/.pi/agent/extensions/guardrails.json or set \`pathAccess.mode\` to "allow".`;
+  }
+  if (/Read-only file system/.test(output)) {
+    return `subprocess reported "Read-only file system" — the dedicated job's writes were rejected. Check sandboxing (bwrap/firejail/etc.) on the pi binary path.`;
+  }
+  if (/Connection error\.|ECONNREFUSED|ENETUNREACH|ETIMEDOUT/.test(output)) {
+    return `network/connection error talking to the model provider. Likely transient — the next 10-min retry should clear it.`;
+  }
+  if (/killed=true/.test(output)) {
+    return `subprocess hit the ${DEDICATED_JOB_TIMEOUT_MIN}-minute timeout without finishing. Either the prompt is too large for one turn, or the agent got stuck in a loop.`;
+  }
+  return null;
+}
+
+/**
+ * Render a flat message array into a human-readable transcript.
+ * Used by both `formatDedicatedRunOutput` and the main-session capture path.
+ */
+export function renderMessages(messages: ReadonlyArray<Record<string, unknown>>): string {
+  const parts: string[] = [];
+  for (const m of messages) {
+    const role = m["role"];
+    if (role === "user") {
+      const text = stringifyContent(m["content"]);
+      if (text) parts.push(`[user]\n${text}`);
+    } else if (role === "assistant") {
+      const content = m["content"];
+      if (Array.isArray(content)) {
+        for (const block of content as Array<Record<string, unknown>>) {
+          const bt = block["type"];
+          if (bt === "text" && typeof block["text"] === "string" && (block["text"] as string).trim()) {
+            parts.push(`[assistant]\n${(block["text"] as string).trim()}`);
+          } else if (bt === "thinking" && typeof block["thinking"] === "string" && (block["thinking"] as string).trim()) {
+            parts.push(`[thinking]\n${(block["thinking"] as string).trim()}`);
+          } else if (bt === "toolCall") {
+            const name = block["name"] as string | undefined;
+            const args = block["arguments"];
+            const argsText = args === undefined ? "" : (() => {
+              try {
+                const json = JSON.stringify(args);
+                return json.length > 500 ? json.slice(0, 500) + "…" : json;
+              } catch {
+                return String(args);
+              }
+            })();
+            parts.push(`[tool: ${name ?? "?"}] ${argsText}`);
+          }
+        }
+      } else if (typeof content === "string" && content.trim()) {
+        parts.push(`[assistant]\n${content.trim()}`);
+      }
+    } else if (role === "toolResult") {
+      const name = m["toolName"] as string | undefined;
+      const text = stringifyContent(m["content"]);
+      const isError = m["isError"] === true;
+      const truncated = text.length > 1000 ? text.slice(0, 1000) + "…" : text;
+      parts.push(`[result: ${name ?? "?"}${isError ? " (error)" : ""}]\n${truncated}`);
+    }
+  }
+  return parts.join("\n\n");
+}
+
+function stringifyContent(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return (content as Array<Record<string, unknown>>)
+      .filter((b) => b["type"] === "text" && typeof b["text"] === "string")
+      .map((b) => (b["text"] as string).trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
 }

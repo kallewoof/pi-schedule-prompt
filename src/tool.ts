@@ -131,6 +131,7 @@ export function createCronTool(
               runCount: 0,
               description: params.jobDescription,
               guaranteed: params.guaranteed ?? false,
+              dedicatedContext: params.dedicatedContext ?? false,
               targetContext: (ctx as any)?.context as string | undefined,
             };
 
@@ -262,6 +263,7 @@ export function createCronTool(
             if (params.prompt) updates.prompt = params.prompt;
             if (params.jobDescription !== undefined) updates.description = params.jobDescription;
             if (params.guaranteed !== undefined) updates.guaranteed = params.guaranteed;
+            if (params.dedicatedContext !== undefined) updates.dedicatedContext = params.dedicatedContext;
             if (params.jobType) updates.type = params.jobType as CronJobType;
 
             // Use the new type if being changed, otherwise keep existing
@@ -342,7 +344,7 @@ export function createCronTool(
               const lastStr = job.lastRun ? `Last: ${formatISOLocal(job.lastRun)}` : "Never run";
 
               lines.push(`${status} ${job.name} (${job.id})`);
-              lines.push(`  Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Schedule: ${formatSchedule(job.type, job.schedule)} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
+              lines.push(`  Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Schedule: ${formatSchedule(job.type, job.schedule)} | Guaranteed: ${job.guaranteed ? "yes" : "no"} | Dedicated: ${job.dedicatedContext ? "yes" : "no"}`);
               lines.push(`  Prompt: ${job.prompt}`);
               lines.push(`  ${lastStr} ${nextStr ? `| ${nextStr}` : ""}`);
               lines.push(`  Runs: ${job.runCount} | Status: ${job.lastStatus || "pending"}`);
@@ -432,8 +434,9 @@ export function createCronTool(
           lines.push(`${status} ${theme.fg("text", job.name)} ${theme.fg("dim", `(${job.id})`)}`);
           const recurringStr = job.type !== "once" ? theme.fg("success", "yes") : theme.fg("dim", "no");
           const guaranteedStr = job.guaranteed ? theme.fg("warning", "⚡ yes") : theme.fg("dim", "no");
+          const dedicatedStr = job.dedicatedContext ? theme.fg("accent", "🔒 yes") : theme.fg("dim", "no");
           lines.push(
-            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Recurring:")} ${recurringStr} ${theme.fg("dim", "| Schedule:")} ${formatSchedule(job.type, job.schedule)} ${theme.fg("dim", "| Guaranteed:")} ${guaranteedStr}`
+            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Recurring:")} ${recurringStr} ${theme.fg("dim", "| Schedule:")} ${formatSchedule(job.type, job.schedule)} ${theme.fg("dim", "| Guaranteed:")} ${guaranteedStr} ${theme.fg("dim", "| Dedicated:")} ${dedicatedStr}`
           );
           lines.push(`  ${theme.fg("dim", "Prompt:")} ${job.prompt}`);
           if (job.lastRun) {

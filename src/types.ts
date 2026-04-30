@@ -46,10 +46,12 @@ export interface CronJob {
   guaranteed?: boolean;
   /** RPC context name to route the fired response to (e.g. Signal thread or group); undefined = main session */
   targetContext?: string;
+  /** If true, run prompt in a fresh blank subprocess context; main session receives only start/end notifications */
+  dedicatedContext?: boolean;
 }
 
 /**
- * Record of a single scheduled job run, persisted for /replay
+ * Record of a single scheduled job run, persisted for /schedule-prompt replay
  */
 export interface RunRecord {
   jobId: string;
@@ -73,7 +75,7 @@ export interface CronStore {
   jobs: CronJob[];
   version: number;
   widgetVisible?: boolean;
-  /** Last 50 run records, newest last */
+  /** Last 10 run records, newest last */
   runHistory?: RunRecord[];
 }
 
@@ -132,9 +134,23 @@ export const CronToolParams = Type.Object({
         "If true, run missed jobs immediately on startup. If false (default), silently drop missed recurring jobs or mark missed one-time jobs as failed.",
     })
   ),
+  dedicatedContext: Type.Optional(
+    Type.Boolean({
+      description:
+        "If true, run the prompt in a blank dedicated subprocess context. The current session receives only start/end notifications; full output is viewable via /schedule-prompt replay.",
+    })
+  ),
 });
 
 export type CronToolParamsType = Static<typeof CronToolParams>;
+
+/**
+ * Mirrors pi-mono's `SessionShutdownEvent["reason"]`.
+ * `"quit"` is the only value that means the host process is exiting; the rest
+ * are session replacements where the host process keeps running and any
+ * dedicated-context subprocesses should be left alive across the swap.
+ */
+export type SessionShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 /**
  * Event emitted when a job is added, removed, or updated
