@@ -57,6 +57,11 @@ export class CronScheduler {
    */
   private deferralTimers = new Set<NodeJS.Timeout>();
 
+  /** Job IDs currently running in dedicated subprocess mode. */
+  private runningDedicatedJobs = new Set<string>();
+  /** AbortControllers for in-flight dedicated subprocess execs, keyed by jobId. */
+  private dedicatedJobControllers = new Map<string, AbortController>();
+
   private readonly storage: CronStorage;
   private readonly pi: ExtensionAPI;
   private readonly leaderPidPath: string;
@@ -130,6 +135,11 @@ export class CronScheduler {
     this.contextTailJobId = null;
     this.currentTurnJobId = null;
     this.currentTurnStartTime = null;
+    for (const controller of this.dedicatedJobControllers.values()) {
+      controller.abort();
+    }
+    this.dedicatedJobControllers.clear();
+    this.runningDedicatedJobs.clear();
   }
 
   addJob(job: CronJob): void {
@@ -456,6 +466,11 @@ export class CronScheduler {
   // --- Execution ---
 
   private async executeJobIfLeader(job: CronJob): Promise<void> {
+    if (job.dedicatedContext) {
+      // Runs in an isolated subprocess — does not block the main agent.
+      void this.executeDedicatedJob(job);
+      return;
+    }
     if (this.agentRunning || this.retrying || this.sending) {
       // Block new sends while the agent is active or a send/retry is in-flight.
       if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
@@ -632,6 +647,11 @@ export class CronScheduler {
     const current = this.storage.getJob(jobId);
     if (!current || !current.enabled || !current.guaranteed) return;
 
+    if (current.dedicatedContext) {
+      void this.executeDedicatedJob(current);
+      return;
+    }
+
     this.retrying = true;
     this.retryingJobId = jobId;
     this.currentTurnJobId = jobId;
@@ -673,6 +693,121 @@ export class CronScheduler {
         this.scheduleRetryTimer(jobId);
       }
     }
+  }
+
+  private async executeDedicatedJob(job: CronJob): Promise<void> {
+    if (this.runningDedicatedJobs.has(job.id)) return;
+    this.runningDedicatedJobs.add(job.id);
+
+    const startTime = new Date().toISOString();
+    const controller = new AbortController();
+    this.dedicatedJobControllers.set(job.id, controller);
+
+    const piAny = this.pi as any;
+    const notifyToContext =
+      job.targetContext &&
+      typeof piAny.sendMessageToContext === "function";
+
+    const notify = (customType: string, text: string, details: Record<string, unknown>) => {
+      const msg = {
+        customType,
+        content: [{ type: "text" as const, text }],
+        display: true,
+        details,
+      };
+      if (notifyToContext) {
+        piAny.sendMessageToContext(job.targetContext, msg);
+      } else {
+        this.pi.sendMessage(msg);
+      }
+    };
+
+    notify(
+      "scheduled_prompt_begin",
+      `[Scheduled Prompt] Processing begins: ${job.name} → "${job.prompt}"`,
+      { jobId: job.id, jobName: job.name, prompt: job.prompt }
+    );
+
+    this.storage.updateJob(job.id, { lastStatus: "running" });
+    this.emitChange({ type: "fire", job });
+
+    const wrappedPrompt =
+      `This is an automated scheduled prompt. Interpret and execute the following directly — ` +
+      `phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n${job.prompt}`;
+
+    let status: "success" | "error" = "success";
+    let output = "";
+
+    try {
+      const result = await this.pi.exec(
+        "pi",
+        ["-p", "--no-extensions", "--no-session", wrappedPrompt],
+        { signal: controller.signal, timeout: 5 * 60 * 1000 }
+      );
+      output = result.stdout.trim();
+      if (result.stderr.trim()) output += "\n\n[stderr]\n" + result.stderr.trim();
+      status = result.code === 0 ? "success" : "error";
+    } catch (error) {
+      if ((error as Error & { name?: string }).name === "AbortError") {
+        // Scheduler was stopped — exit without updating storage
+        this.runningDedicatedJobs.delete(job.id);
+        this.dedicatedJobControllers.delete(job.id);
+        return;
+      }
+      output = error instanceof Error ? error.message : String(error);
+      status = "error";
+    } finally {
+      this.runningDedicatedJobs.delete(job.id);
+      this.dedicatedJobControllers.delete(job.id);
+    }
+
+    this.captureRunRecordFromOutput(job, output, status, startTime);
+
+    if (job.type === "once") {
+      if (status === "success" || !job.guaranteed) {
+        this.storage.removeJob(job.id);
+        this.emitChange({ type: "remove", jobId: job.id });
+      } else {
+        this.storage.updateJob(job.id, { lastStatus: "error" });
+        this.emitChange({ type: "error", jobId: job.id, error: "Subprocess error (retrying in 10m)" });
+        this.scheduleRetryTimer(job.id);
+      }
+    } else {
+      const nextRun = this.getNextRun(job.id);
+      this.storage.updateJob(job.id, {
+        lastRun: new Date().toISOString(),
+        lastStatus: status,
+        runCount: job.runCount + 1,
+        nextRun: nextRun?.toISOString(),
+      });
+      this.emitChange({ type: "fire", job });
+    }
+
+    notify(
+      "scheduled_prompt_end",
+      `[Scheduled Prompt] Processing ended. See /replay ${job.id} to review.`,
+      { jobId: job.id, jobName: job.name }
+    );
+  }
+
+  private captureRunRecordFromOutput(
+    job: CronJob,
+    output: string,
+    status: "success" | "error",
+    startTime: string | null
+  ): void {
+    const endTime = new Date().toISOString();
+    this.storage.addRunRecord({
+      jobId: job.id,
+      jobName: job.name,
+      jobPrompt: job.prompt,
+      schedule: job.schedule,
+      jobType: job.type,
+      startTime: startTime ?? endTime,
+      endTime,
+      output,
+      status,
+    });
   }
 
   private captureRunRecord(

@@ -46,6 +46,8 @@ export interface CronJob {
   guaranteed?: boolean;
   /** RPC context name to route the fired response to (e.g. Signal thread or group); undefined = main session */
   targetContext?: string;
+  /** If true, run prompt in a fresh blank subprocess context; main session receives only start/end notifications */
+  dedicatedContext?: boolean;
 }
 
 /**
@@ -130,6 +132,12 @@ export const CronToolParams = Type.Object({
     Type.Boolean({
       description:
         "If true, run missed jobs immediately on startup. If false (default), silently drop missed recurring jobs or mark missed one-time jobs as failed.",
+    })
+  ),
+  dedicatedContext: Type.Optional(
+    Type.Boolean({
+      description:
+        "If true, run the prompt in a blank dedicated subprocess context. The current session receives only start/end notifications; full output is viewable via /replay.",
     })
   ),
 });

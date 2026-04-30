@@ -32,10 +32,30 @@ export default async function (pi: ExtensionAPI) {
     const details = message.details as { jobId: string; jobName: string; prompt: string } | undefined;
     const jobName = details?.jobName || "Unknown";
     const prompt = details?.prompt || "";
-    
+
     return new Text(
-      theme.fg("accent", `🕐 Scheduled: ${jobName}`) + 
+      theme.fg("accent", `🕐 Scheduled: ${jobName}`) +
       (prompt ? theme.fg("dim", ` → "${prompt}"`) : ""),
+      0,
+      0
+    );
+  });
+
+  pi.registerMessageRenderer("scheduled_prompt_begin", (message, _options, theme) => {
+    const details = message.details as { jobId: string; jobName: string; prompt: string } | undefined;
+    return new Text(
+      theme.fg("accent", `⏳ [Scheduled Prompt] Processing begins: ${details?.jobName ?? "Unknown"}`) +
+      (details?.prompt ? theme.fg("dim", ` → "${details.prompt}"`) : ""),
+      0,
+      0
+    );
+  });
+
+  pi.registerMessageRenderer("scheduled_prompt_end", (message, _options, theme) => {
+    const details = message.details as { jobId: string; jobName: string } | undefined;
+    return new Text(
+      theme.fg("success", `✓ [Scheduled Prompt] Processing ended.`) +
+      theme.fg("dim", ` See /replay ${details?.jobId ?? ""} to review.`),
       0,
       0
     );
@@ -387,12 +407,21 @@ export default async function (pi: ExtensionAPI) {
         const idx = runHistory.length - n;
         record = idx >= 0 ? runHistory[idx] : undefined;
       } else {
-        const lower = arg.toLowerCase();
+        // Exact job-ID match first, then substring on name/prompt
         for (let i = runHistory.length - 1; i >= 0; i--) {
-          const r = runHistory[i];
-          if (r.jobName.toLowerCase().includes(lower) || r.jobPrompt.toLowerCase().includes(lower)) {
-            record = r;
+          if (runHistory[i].jobId === arg) {
+            record = runHistory[i];
             break;
+          }
+        }
+        if (!record) {
+          const lower = arg.toLowerCase();
+          for (let i = runHistory.length - 1; i >= 0; i--) {
+            const r = runHistory[i];
+            if (r.jobName.toLowerCase().includes(lower) || r.jobPrompt.toLowerCase().includes(lower)) {
+              record = r;
+              break;
+            }
           }
         }
       }
