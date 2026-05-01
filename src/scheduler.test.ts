@@ -44,6 +44,7 @@ function makeMockPi() {
     sendMessage: vi.fn(),
     sendUserMessage: vi.fn(),
     retryLastTurn: vi.fn(),
+    exec: vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false })),
     events: { emit: vi.fn() },
   };
 }
@@ -1133,5 +1134,123 @@ describe("realistic pi behavior: sendUserMessage wrapper is fire-and-forget", ()
       job.id,
       expect.objectContaining({ lastStatus: "error" }),
     );
+  });
+});
+
+// ---- dedicated-context job: failure detection ----
+//
+// Regression: `pi -p` exits with code 0 even when the request failed (e.g. a
+// transient "Connection error." emitted to stderr with no assistant reply on
+// stdout). Trusting the exit code alone caused the scheduler to mark these
+// runs as "success" — once-jobs were dropped, recurring jobs had their
+// lastStatus flipped to "success", and guaranteed retries never fired.
+//
+// We treat empty stdout as a failure regardless of exit code, since a
+// successful `pi -p` always produces an assistant reply.
+
+describe("dedicated-context job failure detection", () => {
+  async function runDedicated(scheduler: CronScheduler, job: CronJob) {
+    await (scheduler as any).executeDedicatedJob(job);
+  }
+
+  it("marks a once-job as error and schedules retry when stdout is empty and stderr has a connection error (exit 0)", async () => {
+    const job = makeJob({ guaranteed: true, dedicatedContext: true });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    pi.exec.mockResolvedValueOnce({ stdout: "", stderr: "Connection error.", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi);
+    await runDedicated(scheduler, job);
+
+    // Job NOT removed; lastStatus flipped to "error"; retry timer queued.
+    expect(storage.removeJob).not.toHaveBeenCalled();
+    expect(storage.updateJob).toHaveBeenCalledWith(job.id, { lastStatus: "error" });
+
+    const record = (storage.addRunRecord as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(record).toMatchObject({ jobId: job.id, status: "error" });
+    expect(record.output).toContain("Connection error.");
+
+    // Retry fires after 10m and re-invokes pi.exec (one retry attempt).
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    expect(pi.exec).toHaveBeenCalledTimes(2);
+  });
+
+  it("marks a once-job as error even with empty stdout AND empty stderr (exit 0)", async () => {
+    const job = makeJob({ guaranteed: true, dedicatedContext: true });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    pi.exec.mockResolvedValueOnce({ stdout: "", stderr: "", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi);
+    await runDedicated(scheduler, job);
+
+    expect(storage.removeJob).not.toHaveBeenCalled();
+    expect(storage.updateJob).toHaveBeenCalledWith(job.id, { lastStatus: "error" });
+  });
+
+  it("marks a non-guaranteed once-job as error (and removes it) when stdout is empty", async () => {
+    const job = makeJob({ guaranteed: false, dedicatedContext: true });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    pi.exec.mockResolvedValueOnce({ stdout: "", stderr: "Connection error.", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi);
+    await runDedicated(scheduler, job);
+
+    // Non-guaranteed once-jobs are dropped on failure (not retried), but the
+    // run record must still report status: "error".
+    expect(storage.removeJob).toHaveBeenCalledWith(job.id);
+    const record = (storage.addRunRecord as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(record).toMatchObject({ status: "error" });
+  });
+
+  it("treats a successful run (non-empty stdout, exit 0) as success and removes the once-job", async () => {
+    const job = makeJob({ guaranteed: true, dedicatedContext: true });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    pi.exec.mockResolvedValueOnce({ stdout: "All done.", stderr: "", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi);
+    await runDedicated(scheduler, job);
+
+    expect(storage.removeJob).toHaveBeenCalledWith(job.id);
+    const record = (storage.addRunRecord as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(record).toMatchObject({ status: "success", output: "All done." });
+  });
+
+  it("treats a non-zero exit code as error even when stdout is non-empty", async () => {
+    const job = makeJob({ guaranteed: true, dedicatedContext: true });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    pi.exec.mockResolvedValueOnce({ stdout: "partial reply", stderr: "boom", code: 2, killed: false });
+
+    const scheduler = makeScheduler(storage, pi);
+    await runDedicated(scheduler, job);
+
+    expect(storage.removeJob).not.toHaveBeenCalled();
+    expect(storage.updateJob).toHaveBeenCalledWith(job.id, { lastStatus: "error" });
+  });
+
+  it("records error status on a recurring job's run record when stdout is empty", async () => {
+    const job = makeJob({
+      type: "interval",
+      schedule: "1h",
+      dedicatedContext: true,
+    });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    pi.exec.mockResolvedValueOnce({ stdout: "", stderr: "Connection error.", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi);
+    await runDedicated(scheduler, job);
+
+    // Recurring job: not removed, but lastStatus must be "error" — not "success".
+    expect(storage.removeJob).not.toHaveBeenCalled();
+    const updateCalls = (storage.updateJob as ReturnType<typeof vi.fn>).mock.calls;
+    const finalUpdate = updateCalls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({ lastStatus: "error" });
+
+    const record = (storage.addRunRecord as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(record).toMatchObject({ status: "error" });
   });
 });

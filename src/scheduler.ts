@@ -744,9 +744,13 @@ export class CronScheduler {
         ["-p", "--no-extensions", "--no-session", wrappedPrompt],
         { signal: controller.signal, timeout: 5 * 60 * 1000 }
       );
-      output = result.stdout.trim();
-      if (result.stderr.trim()) output += "\n\n[stderr]\n" + result.stderr.trim();
-      status = result.code === 0 ? "success" : "error";
+      const stdoutTrimmed = result.stdout.trim();
+      const stderrTrimmed = result.stderr.trim();
+      output = stdoutTrimmed;
+      if (stderrTrimmed) output += "\n\n[stderr]\n" + stderrTrimmed;
+      // Empty stdout means pi produced no assistant reply — treat as failure
+      // even if the exit code is 0 (e.g. transient "Connection error." on stderr).
+      status = result.code === 0 && stdoutTrimmed.length > 0 ? "success" : "error";
     } catch (error) {
       if ((error as Error & { name?: string }).name === "AbortError") {
         // Scheduler was stopped — exit without updating storage
