@@ -191,7 +191,7 @@ export default async function (pi: ExtensionAPI) {
           for (const { job, nextRun } of sorted) {
             const status = job.enabled ? "✓" : "✗";
             lines.push(`${status} ${job.name} (${job.id})`);
-            lines.push(`  Schedule: ${formatSchedule(job.type, job.schedule)} | Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Guaranteed: ${job.guaranteed ? "yes" : "no"}`);
+            lines.push(`  Schedule: ${formatSchedule(job.type, job.schedule)} | Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Guaranteed: ${job.guaranteed ? "yes" : "no"} | Dedicated: ${job.dedicatedContext ? "yes" : "no"}`);
             lines.push(`  Prompt: ${job.prompt}`);
             if (nextRun) {
               const hint = formatRelativeHint(nextRun);
