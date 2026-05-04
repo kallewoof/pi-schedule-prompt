@@ -81,9 +81,20 @@ export class CronScheduler {
 
       if (this.isMissed(job, now)) {
         if (job.guaranteed) {
-          void this.executeJobIfLeader(job);
-          if (job.type !== "once") {
-            this.scheduleJob(job);
+          // If the previous attempt errored or was sent-but-unconfirmed, route through
+          // the retry timer rather than firing immediately on session_start. This prevents
+          // every failed dedicated job from re-launching in parallel each /new, which can
+          // overwhelm the model API and produce more failures.
+          if (job.lastStatus === "error" || job.lastStatus === "sent") {
+            this.scheduleRetryTimer(job.id);
+            if (job.type !== "once") {
+              this.scheduleJob(job);
+            }
+          } else {
+            void this.executeJobIfLeader(job);
+            if (job.type !== "once") {
+              this.scheduleJob(job);
+            }
           }
         } else if (job.type === "once") {
           this.storage.updateJob(job.id, {
@@ -622,6 +633,17 @@ export class CronScheduler {
    * in which case the job is deferred until the active retry resolves.
    */
   private scheduleRetryTimer(jobId: string): void {
+    // Cancel any pending retry for this job before creating a new one.
+    // Without this, scheduleRetryTimer being called twice (e.g. once from start()
+    // for an error-state job and again after a fresh failure of the same job)
+    // would leave both timers active. Both fire in succession — the first triggers
+    // a retry, and the second fires shortly after, kicking off another retry as
+    // soon as the first's runningDedicatedJobs guard clears. Net effect: the user
+    // sees back-to-back duplicate runs of the same scheduled prompt.
+    const existing = this.retries.get(jobId);
+    if (existing) {
+      clearTimeout(existing);
+    }
     const retry = setTimeout(() => {
       this.retries.delete(jobId);
       if (this.agentRunning || this.retrying || this.sending) {
@@ -725,7 +747,7 @@ export class CronScheduler {
     notify(
       "scheduled_prompt_begin",
       `[Scheduled Prompt] Processing begins: ${job.name} → "${job.prompt}"`,
-      { jobId: job.id, jobName: job.name, prompt: job.prompt }
+      { jobId: job.id, jobName: job.name, prompt: job.prompt, startTime: startTime }
     );
 
     this.storage.updateJob(job.id, { lastStatus: "running" });
@@ -737,20 +759,22 @@ export class CronScheduler {
 
     let status: "success" | "error" = "success";
     let output = "";
+    const TIMEOUT_MS = 5 * 60 * 1000;
+    const startMs = Date.now();
 
     try {
       const result = await this.pi.exec(
         "pi",
-        ["-p", "--no-extensions", "--no-session", wrappedPrompt],
-        { signal: controller.signal, timeout: 5 * 60 * 1000 }
+        ["--mode", "json", "-p", "--no-extensions", "--no-session", wrappedPrompt],
+        { signal: controller.signal, timeout: TIMEOUT_MS }
       );
-      const stdoutTrimmed = result.stdout.trim();
-      const stderrTrimmed = result.stderr.trim();
-      output = stdoutTrimmed;
-      if (stderrTrimmed) output += "\n\n[stderr]\n" + stderrTrimmed;
-      // Empty stdout means pi produced no assistant reply — treat as failure
-      // even if the exit code is 0 (e.g. transient "Connection error." on stderr).
-      status = result.code === 0 && stdoutTrimmed.length > 0 ? "success" : "error";
+      const durationS = Math.round((Date.now() - startMs) / 1000);
+      const formatted = formatDedicatedRunOutput(result.stdout, result.stderr, result.code, result.killed, durationS);
+      output = formatted.output;
+      // A successful pi --mode json run always emits an agent_end event with at least one
+      // assistant message containing text. If we didn't see that, treat as failure even
+      // when the exit code is 0 (timeout-killed processes resolve with code 0 sometimes).
+      status = result.code === 0 && !result.killed && formatted.hasAgentEnd ? "success" : "error";
     } catch (error) {
       if ((error as Error & { name?: string }).name === "AbortError") {
         // Scheduler was stopped — exit without updating storage
@@ -758,7 +782,9 @@ export class CronScheduler {
         this.dedicatedJobControllers.delete(job.id);
         return;
       }
-      output = error instanceof Error ? error.message : String(error);
+      const durationS = Math.round((Date.now() - startMs) / 1000);
+      const errMsg = error instanceof Error ? error.message : String(error);
+      output = `[exit=? killed=? duration=${durationS}s]\n[error]\n${errMsg}`;
       status = "error";
     } finally {
       this.runningDedicatedJobs.delete(job.id);
@@ -785,12 +811,27 @@ export class CronScheduler {
         nextRun: nextRun?.toISOString(),
       });
       this.emitChange({ type: "fire", job });
+      // Recurring guaranteed jobs that fail need a retry timer too — without this,
+      // a failed daily/hourly job has no recovery path until its next natural cron tick.
+      if (status === "error" && job.guaranteed) {
+        this.scheduleRetryTimer(job.id);
+      }
     }
 
+    const hint = status === "error" ? detectFailureHint(output) : null;
+    const endText = hint
+      ? `[Scheduled Prompt] Processing ended (failed). See /replay ${job.id} to review.\n⚠️ Likely cause: ${hint}`
+      : `[Scheduled Prompt] Processing ended. See /replay ${job.id} to review.`;
     notify(
       "scheduled_prompt_end",
-      `[Scheduled Prompt] Processing ended. See /replay ${job.id} to review.`,
-      { jobId: job.id, jobName: job.name }
+      endText,
+      {
+        jobId: job.id,
+        jobName: job.name,
+        failureHint: hint ?? undefined,
+        startTime,
+        endTime: new Date().toISOString(),
+      }
     );
   }
 
@@ -857,28 +898,10 @@ export class CronScheduler {
         }
       }
     }
-    // Collect all assistant text blocks after the turn start
-    const parts: string[] = [];
+    // Render every message after the turn start: thinking, text, tool calls, tool results.
     const startIdx = turnStartIdx >= 0 ? turnStartIdx + 1 : 0;
-    for (let i = startIdx; i < msgs.length; i++) {
-      const m = msgs[i];
-      if (m["role"] !== "assistant") continue;
-      const c = m["content"];
-      if (typeof c === "string" && c.trim()) {
-        parts.push(c.trim());
-      } else if (Array.isArray(c)) {
-        for (const block of c as Array<Record<string, unknown>>) {
-          if (
-            block["type"] === "text" &&
-            typeof block["text"] === "string" &&
-            (block["text"] as string).trim()
-          ) {
-            parts.push((block["text"] as string).trim());
-          }
-        }
-      }
-    }
-    return parts.join("\n\n");
+    const slice = msgs.slice(startIdx);
+    return renderMessages(slice);
   }
 
   private processNextDeferred(): void {
@@ -981,4 +1004,202 @@ export class CronScheduler {
 
     return value * multipliers[unit];
   }
+}
+
+/**
+ * Format a dedicated subprocess run for storage as `RunRecord.output`.
+ * Always emits a diagnostic header so empty/timeout runs aren't blank.
+ * Parses `pi --mode json` JSONL stdout to render thinking, tool calls, and tool results.
+ */
+export function formatDedicatedRunOutput(
+  stdout: string,
+  stderr: string,
+  code: number,
+  killed: boolean,
+  durationS: number
+): { output: string; hasAgentEnd: boolean } {
+  const header = `[exit=${code} killed=${killed} duration=${durationS}s]`;
+  const events: Array<Record<string, unknown>> = [];
+  let hasAgentEnd = false;
+
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const event = JSON.parse(trimmed) as Record<string, unknown>;
+      events.push(event);
+      if (event["type"] === "agent_end") hasAgentEnd = true;
+    } catch {
+      // Non-JSON line — likely a startup banner or error; ignored for rendering.
+    }
+  }
+
+  const sections: string[] = [header];
+
+  // Prefer the agent_end snapshot (full messages array) when present.
+  let messagesToRender: ReadonlyArray<Record<string, unknown>> | null = null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i];
+    if (ev["type"] === "agent_end" && Array.isArray(ev["messages"])) {
+      messagesToRender = ev["messages"] as Array<Record<string, unknown>>;
+      break;
+    }
+  }
+
+  // Fall back to reconstructing message state from message_*/turn_end events
+  // when the stream was cut off before agent_end (e.g. timeout kill).
+  //
+  // CRITICAL: each streaming `message_update` event carries a snapshot of the
+  // *same* logical message with growing content. Naively pushing every event's
+  // `message` produces N copies of the same logical message, each rendered
+  // separately. A single 5-min run with 5000+ thinking deltas produced 27 MB
+  // of duplicated `[thinking]` blocks before this dedup. We collapse runs of
+  // updates per logical message into a single final state.
+  if (!messagesToRender) {
+    const closedMessages: Array<Record<string, unknown>> = [];
+    let openMessage: Record<string, unknown> | null = null;
+    for (const ev of events) {
+      const t = ev["type"];
+      if (t === "message_start") {
+        if (openMessage) closedMessages.push(openMessage);
+        openMessage = (ev["message"] as Record<string, unknown> | undefined) ?? null;
+      } else if (t === "message_update") {
+        const m = ev["message"] as Record<string, unknown> | undefined;
+        if (m) openMessage = m; // replace with latest snapshot of the same message
+      } else if (t === "message_end") {
+        const m = ev["message"] as Record<string, unknown> | undefined;
+        if (m) closedMessages.push(m);
+        else if (openMessage) closedMessages.push(openMessage);
+        openMessage = null;
+      } else if (t === "turn_end") {
+        // turn_end carries the assistant message + toolResults; useful when
+        // individual message_end events were dropped.
+        const m = ev["message"] as Record<string, unknown> | undefined;
+        if (m && !closedMessages.includes(m)) closedMessages.push(m);
+        const toolResults = ev["toolResults"];
+        if (Array.isArray(toolResults)) {
+          for (const tr of toolResults as Array<Record<string, unknown>>) {
+            closedMessages.push(tr);
+          }
+        }
+      }
+    }
+    if (openMessage) closedMessages.push(openMessage);
+    if (closedMessages.length > 0) messagesToRender = closedMessages;
+  }
+
+  if (messagesToRender && messagesToRender.length > 0) {
+    const rendered = renderMessages(messagesToRender);
+    if (rendered) sections.push(rendered);
+  } else if (stdout.trim().length > 0 && events.length === 0) {
+    // No JSON parsed at all — store raw stdout (legacy `pi -p` mode or unexpected output).
+    sections.push(stdout.trim());
+  }
+
+  if (stderr.trim().length > 0) {
+    sections.push(`[stderr]\n${stderr.trim()}`);
+  }
+
+  let output = sections.join("\n\n");
+  // Cap at 64 KB to keep storage bounded. Without this, a runaway agent that
+  // emits multi-MB thinking blocks per run plus retained records can balloon
+  // the storage file to hundreds of MB.
+  const MAX_OUTPUT_BYTES = 64 * 1024;
+  if (output.length > MAX_OUTPUT_BYTES) {
+    const head = output.slice(0, MAX_OUTPUT_BYTES);
+    output = `${head}\n\n[output truncated; full size = ${output.length} bytes]`;
+  }
+  return { output, hasAgentEnd };
+}
+
+/**
+ * Inspect a rendered run output for known failure signatures and return a short
+ * actionable hint describing the likely cause. Returns null if no match.
+ *
+ * Patterns target the things that have actually broken dedicated runs in practice:
+ * pi-guardrails path-access blocks (often the bash tool tries to write to /tmp for
+ * truncated output and the non-interactive subprocess can't answer the prompt),
+ * read-only filesystems, model/connection errors, and unrecognized agent stalls.
+ */
+export function detectFailureHint(output: string): string | null {
+  // pi-guardrails path-access denial. Two flavours: explicit "no UI to confirm"
+  // (mode=ask in a non-interactive subprocess) and the generic block string.
+  const noUiMatch = output.match(/Access to ([^\s]+) is blocked \(outside working directory, no UI to confirm\)/);
+  if (noUiMatch) {
+    return `pi-guardrails blocked access to ${noUiMatch[1]} (no UI to confirm in dedicated subprocess). Add the path to \`pathAccess.allowedPaths\` in ~/.pi/agent/extensions/guardrails.json.`;
+  }
+  const blockedMatch = output.match(/Access to ([^\s]+) is blocked \(outside working directory\)/);
+  if (blockedMatch) {
+    return `pi-guardrails blocked access to ${blockedMatch[1]}. Add the path to \`pathAccess.allowedPaths\` in ~/.pi/agent/extensions/guardrails.json or set \`pathAccess.mode\` to "allow".`;
+  }
+  if (/Read-only file system/.test(output)) {
+    return `subprocess reported "Read-only file system" — the dedicated job's writes were rejected. Check sandboxing (bwrap/firejail/etc.) on the pi binary path.`;
+  }
+  if (/Connection error\.|ECONNREFUSED|ENETUNREACH|ETIMEDOUT/.test(output)) {
+    return `network/connection error talking to the model provider. Likely transient — the next 10-min retry should clear it.`;
+  }
+  if (/killed=true/.test(output)) {
+    return `subprocess hit the 5-minute timeout without finishing. Either the prompt is too large for one turn, or the agent got stuck in a loop.`;
+  }
+  return null;
+}
+
+/**
+ * Render a flat message array into a human-readable transcript.
+ * Used by both `formatDedicatedRunOutput` and the main-session capture path.
+ */
+export function renderMessages(messages: ReadonlyArray<Record<string, unknown>>): string {
+  const parts: string[] = [];
+  for (const m of messages) {
+    const role = m["role"];
+    if (role === "user") {
+      const text = stringifyContent(m["content"]);
+      if (text) parts.push(`[user]\n${text}`);
+    } else if (role === "assistant") {
+      const content = m["content"];
+      if (Array.isArray(content)) {
+        for (const block of content as Array<Record<string, unknown>>) {
+          const bt = block["type"];
+          if (bt === "text" && typeof block["text"] === "string" && (block["text"] as string).trim()) {
+            parts.push(`[assistant]\n${(block["text"] as string).trim()}`);
+          } else if (bt === "thinking" && typeof block["thinking"] === "string" && (block["thinking"] as string).trim()) {
+            parts.push(`[thinking]\n${(block["thinking"] as string).trim()}`);
+          } else if (bt === "toolCall") {
+            const name = block["name"] as string | undefined;
+            const args = block["arguments"];
+            const argsText = args === undefined ? "" : (() => {
+              try {
+                const json = JSON.stringify(args);
+                return json.length > 500 ? json.slice(0, 500) + "…" : json;
+              } catch {
+                return String(args);
+              }
+            })();
+            parts.push(`[tool: ${name ?? "?"}] ${argsText}`);
+          }
+        }
+      } else if (typeof content === "string" && content.trim()) {
+        parts.push(`[assistant]\n${content.trim()}`);
+      }
+    } else if (role === "toolResult") {
+      const name = m["toolName"] as string | undefined;
+      const text = stringifyContent(m["content"]);
+      const isError = m["isError"] === true;
+      const truncated = text.length > 1000 ? text.slice(0, 1000) + "…" : text;
+      parts.push(`[result: ${name ?? "?"}${isError ? " (error)" : ""}]\n${truncated}`);
+    }
+  }
+  return parts.join("\n\n");
+}
+
+function stringifyContent(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return (content as Array<Record<string, unknown>>)
+      .filter((b) => b["type"] === "text" && typeof b["text"] === "string")
+      .map((b) => (b["text"] as string).trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
 }

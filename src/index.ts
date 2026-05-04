@@ -10,7 +10,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import type { RunRecord } from "./types.js";
+import type { CronJob, RunRecord } from "./types.js";
 import { Key } from "@mariozechner/pi-tui";
 import { Container, Text } from "@mariozechner/pi-tui";
 import { CronStorage } from "./storage.js";
@@ -19,6 +19,16 @@ import { createCronTool } from "./tool.js";
 import { CronWidget } from "./ui/cron-widget.js";
 import { formatLocalDateTime, formatRelativeHint, formatSchedule, sortJobsByNextRun } from "./utils.js";
 import { nanoid } from "nanoid";
+
+/**
+ * Returns the disabled jobs that should be removed on session shutdown.
+ * Only one-shot jobs are eligible — recurring (cron/interval) jobs are kept
+ * even when disabled, since users often disable them temporarily while
+ * investigating failures and silent deletion would destroy that work.
+ */
+export function pickJobsToAutoCleanup(jobs: ReadonlyArray<CronJob>): CronJob[] {
+  return jobs.filter((j) => !j.enabled && j.type === "once");
+}
 
 export default async function (pi: ExtensionAPI) {
   let storage: CronStorage;
@@ -42,9 +52,13 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.registerMessageRenderer("scheduled_prompt_begin", (message, _options, theme) => {
-    const details = message.details as { jobId: string; jobName: string; prompt: string } | undefined;
+    const details = message.details as
+      | { jobId: string; jobName: string; prompt: string; startTime?: string }
+      | undefined;
+    const ts = details?.startTime ? formatLocalDateTime(new Date(details.startTime)) : "";
     return new Text(
       theme.fg("accent", `⏳ [Scheduled Prompt] Processing begins: ${details?.jobName ?? "Unknown"}`) +
+      (ts ? theme.fg("dim", ` [${ts}]`) : "") +
       (details?.prompt ? theme.fg("dim", ` → "${details.prompt}"`) : ""),
       0,
       0
@@ -52,13 +66,42 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.registerMessageRenderer("scheduled_prompt_end", (message, _options, theme) => {
-    const details = message.details as { jobId: string; jobName: string } | undefined;
-    return new Text(
-      theme.fg("success", `✓ [Scheduled Prompt] Processing ended.`) +
-      theme.fg("dim", ` See /replay ${details?.jobId ?? ""} to review.`),
-      0,
-      0
+    const details = message.details as
+      | {
+          jobId: string;
+          jobName: string;
+          failureHint?: string;
+          startTime?: string;
+          endTime?: string;
+        }
+      | undefined;
+    const container = new Container();
+    const headColor = details?.failureHint ? "warning" : "success";
+    const headIcon = details?.failureHint ? "⚠" : "✓";
+    const headText = details?.failureHint
+      ? `[Scheduled Prompt] Processing ended (failed).`
+      : `[Scheduled Prompt] Processing ended.`;
+    let timing = "";
+    if (details?.startTime && details?.endTime) {
+      const startMs = new Date(details.startTime).getTime();
+      const endMs = new Date(details.endTime).getTime();
+      const durationS = Math.max(0, Math.round((endMs - startMs) / 1000));
+      timing = ` [${formatLocalDateTime(new Date(details.endTime))}, ${durationS}s]`;
+    } else if (details?.endTime) {
+      timing = ` [${formatLocalDateTime(new Date(details.endTime))}]`;
+    }
+    container.addChild(
+      new Text(
+        theme.fg(headColor, `${headIcon} ${headText}`) +
+          theme.fg("dim", `${timing} See /replay ${details?.jobId ?? ""} to review.`),
+        0,
+        0
+      )
     );
+    if (details?.failureHint) {
+      container.addChild(new Text(theme.fg("warning", `   ↳ ${details.failureHint}`), 0, 0));
+    }
+    return container;
   });
 
   // Register the tool once with getter functions.
@@ -115,17 +158,13 @@ export default async function (pi: ExtensionAPI) {
   };
 
   const autoCleanupDisabledJobs = () => {
-    // Remove all disabled jobs on exit
-    if (storage) {
-      const jobs = storage.getAllJobs();
-      const disabledJobs = jobs.filter((j) => !j.enabled);
-      
-      if (disabledJobs.length > 0) {
-        console.log(`Auto-cleanup: removing ${disabledJobs.length} disabled job(s)`);
-        for (const job of disabledJobs) {
-          storage.removeJob(job.id);
-        }
-      }
+    if (!storage) return;
+    const removed = pickJobsToAutoCleanup(storage.getAllJobs());
+    for (const job of removed) {
+      storage.removeJob(job.id);
+    }
+    if (removed.length > 0) {
+      console.log(`Auto-cleanup: removing ${removed.length} disabled one-shot job(s)`);
     }
   };
 

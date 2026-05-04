@@ -75,7 +75,7 @@ export interface CronStore {
   jobs: CronJob[];
   version: number;
   widgetVisible?: boolean;
-  /** Last 50 run records, newest last */
+  /** Last 10 run records, newest last */
   runHistory?: RunRecord[];
 }
 

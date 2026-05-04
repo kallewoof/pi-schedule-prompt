@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { CronScheduler } from "./scheduler.js";
+import { CronScheduler, detectFailureHint, formatDedicatedRunOutput, renderMessages } from "./scheduler.js";
 import type { CronJob } from "./types.js";
 
 // ---- mock factories ----
@@ -1204,18 +1204,31 @@ describe("dedicated-context job failure detection", () => {
     expect(record).toMatchObject({ status: "error" });
   });
 
-  it("treats a successful run (non-empty stdout, exit 0) as success and removes the once-job", async () => {
+  it("treats a successful run (JSONL stream with agent_end, exit 0) as success and removes the once-job", async () => {
     const job = makeJob({ guaranteed: true, dedicatedContext: true });
     const storage = makeMockStorage([job]);
     const pi = makeMockPi();
-    pi.exec.mockResolvedValueOnce({ stdout: "All done.", stderr: "", code: 0, killed: false });
+    // pi --mode json emits one JSON object per line; the final agent_end carries the full message array.
+    const jsonl = [
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          { role: "user", content: "do the thing" },
+          { role: "assistant", content: [{ type: "text", text: "All done." }], stopReason: "stop" },
+        ],
+      }),
+    ].join("\n");
+    pi.exec.mockResolvedValueOnce({ stdout: jsonl, stderr: "", code: 0, killed: false });
 
     const scheduler = makeScheduler(storage, pi);
     await runDedicated(scheduler, job);
 
     expect(storage.removeJob).toHaveBeenCalledWith(job.id);
     const record = (storage.addRunRecord as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
-    expect(record).toMatchObject({ status: "success", output: "All done." });
+    expect(record).toMatchObject({ status: "success" });
+    expect(record.output).toContain("All done.");
+    expect(record.output).toContain("[exit=0");
   });
 
   it("treats a non-zero exit code as error even when stdout is non-empty", async () => {
@@ -1252,5 +1265,521 @@ describe("dedicated-context job failure detection", () => {
 
     const record = (storage.addRunRecord as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
     expect(record).toMatchObject({ status: "error" });
+  });
+});
+
+// ---- start(): missed-job triage (Bug 1: /new must not refire failed jobs) ----
+//
+// After /new, scheduler.start() iterates jobs and historically fired any guaranteed
+// job in lastStatus=error|sent immediately. With three dedicated jobs that's three
+// pi subprocesses launched in parallel — the user observed 2/3 timing out at the
+// 5-min mark. Fix: route error/sent state through the retry timer.
+
+describe("start(): triages missed jobs by lastStatus (Bug 1: /new re-fire prevention)", () => {
+  function makeCronJob(overrides: Partial<CronJob> = {}): CronJob {
+    return {
+      id: "cron-1",
+      name: "Daily Routine",
+      schedule: "0 0 8 * * *",
+      prompt: "good morning",
+      enabled: true,
+      type: "cron",
+      runCount: 1,
+      createdAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
+      lastRun: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      guaranteed: true,
+      ...overrides,
+    };
+  }
+
+  it("does NOT immediately fire a guaranteed cron job whose previous run errored", async () => {
+    const job = makeCronJob({ lastStatus: "error", dedicatedContext: true });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+
+    // Microtask flush — confirm no immediate execution.
+    await Promise.resolve();
+    expect(pi.exec).not.toHaveBeenCalled();
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("does NOT immediately fire a guaranteed cron job whose previous run was 'sent' (unconfirmed)", async () => {
+    const job = makeCronJob({ lastStatus: "sent" });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+
+    await Promise.resolve();
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("schedules a 10m retry for a guaranteed cron job left in error state", async () => {
+    const job = makeCronJob({ lastStatus: "error" });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+
+    // No fire yet …
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+
+    // … but after 10 minutes, the retry timer fires the job.
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("DOES immediately fire a guaranteed cron job that's missed-by-schedule with lastStatus=success", async () => {
+    // lastRun was a year ago → the cron schedule has fired many times since →
+    // isMissed() is true. lastStatus=success means this is a genuine miss
+    // (e.g. daemon was offline), not a retry — fire it immediately as before.
+    const job = makeCronJob({
+      lastRun: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString(),
+      lastStatus: "success",
+    });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    // Drain microtasks for the leader-election promise.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire three error-state dedicated jobs in parallel on /new (regression)", async () => {
+    // Reproduces the original report: three dedicated cron jobs all in lastStatus=error
+    // launched as three parallel pi subprocesses → contention → 2/3 timed out.
+    const jobs = [
+      makeCronJob({ id: "j1", name: "Job 1", lastStatus: "error", dedicatedContext: true }),
+      makeCronJob({ id: "j2", name: "Job 2", lastStatus: "error", dedicatedContext: true }),
+      makeCronJob({ id: "j3", name: "Job 3", lastStatus: "error", dedicatedContext: true }),
+    ];
+    const storage = makeMockStorage(jobs);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(pi.exec).not.toHaveBeenCalled();
+  });
+});
+
+// ---- recurring dedicated job retry on failure ----
+
+describe("recurring guaranteed dedicated jobs schedule a retry on failure", () => {
+  it("fires retry 10 minutes after a failed cron-type dedicated run", async () => {
+    const job: CronJob = {
+      id: "cron-1",
+      name: "Daily Check",
+      schedule: "0 0 8 * * *",
+      prompt: "check",
+      enabled: true,
+      type: "cron",
+      runCount: 0,
+      createdAt: new Date().toISOString(),
+      guaranteed: true,
+      dedicatedContext: true,
+    };
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    pi.exec.mockResolvedValue({ stdout: "", stderr: "Connection error.", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi);
+    await (scheduler as any).executeDedicatedJob(job);
+
+    expect(pi.exec).toHaveBeenCalledTimes(1);
+
+    // Without the fix, recurring jobs only retry on next cron tick. With the fix,
+    // a 10-minute retry timer fires the same job again.
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    expect(pi.exec).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---- formatDedicatedRunOutput: Bug 2 (always-have-something-to-show) ----
+
+describe("formatDedicatedRunOutput: always emits diagnostic info (Bug 2)", () => {
+  it("includes exit/killed/duration header even on fully-empty output", () => {
+    const { output, hasAgentEnd } = formatDedicatedRunOutput("", "", 0, true, 300);
+    expect(output).toContain("[exit=0 killed=true duration=300s]");
+    expect(hasAgentEnd).toBe(false);
+  });
+
+  it("appends stderr when present", () => {
+    const { output } = formatDedicatedRunOutput("", "boom", 1, false, 2);
+    expect(output).toContain("[exit=1 killed=false duration=2s]");
+    expect(output).toContain("[stderr]\nboom");
+  });
+
+  it("falls back to raw stdout when it is not JSONL (legacy / non-JSON output)", () => {
+    const { output } = formatDedicatedRunOutput("All done.\n", "", 0, false, 5);
+    expect(output).toContain("All done.");
+  });
+
+  it("parses JSONL agent_end and renders assistant text", () => {
+    const jsonl = [
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "agent_end",
+        messages: [
+          { role: "user", content: "ping" },
+          { role: "assistant", content: [{ type: "text", text: "pong" }], stopReason: "stop" },
+        ],
+      }),
+    ].join("\n");
+    const { output, hasAgentEnd } = formatDedicatedRunOutput(jsonl, "", 0, false, 1);
+    expect(hasAgentEnd).toBe(true);
+    expect(output).toContain("pong");
+  });
+
+  it("renders thinking, tool calls, and tool results from agent_end", () => {
+    const jsonl = JSON.stringify({
+      type: "agent_end",
+      messages: [
+        { role: "user", content: "do work" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "I'll list files first" },
+            { type: "toolCall", id: "t1", name: "Bash", arguments: { command: "ls" } },
+          ],
+          stopReason: "toolUse",
+        },
+        {
+          role: "toolResult",
+          toolCallId: "t1",
+          toolName: "Bash",
+          content: [{ type: "text", text: "file1\nfile2" }],
+          isError: false,
+        },
+        { role: "assistant", content: [{ type: "text", text: "Done." }], stopReason: "stop" },
+      ],
+    });
+    const { output } = formatDedicatedRunOutput(jsonl, "", 0, false, 3);
+    expect(output).toContain("[thinking]");
+    expect(output).toContain("I'll list files first");
+    expect(output).toContain("[tool: Bash]");
+    expect(output).toContain("[result: Bash]");
+    expect(output).toContain("file1");
+    expect(output).toContain("Done.");
+  });
+
+  it("falls back to message_end events when stream was killed before agent_end", () => {
+    const jsonl = [
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "partial" }], stopReason: "stop" },
+      }),
+      // No agent_end — simulating a process killed mid-stream.
+    ].join("\n");
+    const { output, hasAgentEnd } = formatDedicatedRunOutput(jsonl, "", 0, true, 300);
+    expect(hasAgentEnd).toBe(false);
+    expect(output).toContain("partial");
+    expect(output).toContain("killed=true");
+  });
+});
+
+// ---- timer stacking in scheduleRetryTimer (Bug 3 regression) ----
+//
+// Repro for the user's report: a guaranteed dedicated cron job that fails
+// produced 3 back-to-back runs of the same prompt instead of clean 15-minute
+// cycles. Cause: scheduleRetryTimer was called twice (once from start() for
+// the error-state job, again from the cron callback's failure path) without
+// clearing the previous timer. Both timers fire — each calls triggerRetry —
+// and because the runningDedicatedJobs guard only blocks *concurrent* runs,
+// the second timer's retry fires immediately after the first finishes.
+
+describe("scheduleRetryTimer cancels its previous pending timer (Bug 3)", () => {
+  it("calling scheduleRetryTimer twice for the same job results in only ONE retry, not two", async () => {
+    const job: CronJob = {
+      id: "j1",
+      name: "Job",
+      schedule: "0 0 8 * * *",
+      prompt: "p",
+      enabled: true,
+      type: "cron",
+      runCount: 0,
+      createdAt: new Date().toISOString(),
+      guaranteed: true,
+      dedicatedContext: true,
+      lastStatus: "error",
+    };
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    // Subprocess returns success quickly so we can count exec invocations cleanly.
+    pi.exec.mockResolvedValue({
+      stdout: JSON.stringify({
+        type: "agent_end",
+        messages: [
+          { role: "user", content: "p" },
+          { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+        ],
+      }),
+      stderr: "",
+      code: 0,
+      killed: false,
+    });
+    const scheduler = makeScheduler(storage, pi);
+
+    // First call: registers Timer A.
+    (scheduler as any).scheduleRetryTimer(job.id);
+    // Second call (e.g. from a different code path): without the fix, leaves Timer A
+    // pending and adds Timer B → both fire in succession after 10 minutes.
+    (scheduler as any).scheduleRetryTimer(job.id);
+
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    // Drain microtasks/setTimeout(0)s so any second exec call would surface.
+    await vi.advanceTimersByTimeAsync(0);
+
+    // With the fix: exactly ONE exec call. Without the fix: TWO.
+    expect(pi.exec).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT produce duplicate runs when start() and a failed cron tick both schedule retries", async () => {
+    // Real scenario the user observed: dedicated cron job in lastStatus=error.
+    // start() schedules a retry timer. Some path (e.g. the cron callback firing,
+    // or another code path) also schedules a retry. Both timers must collapse.
+    const job: CronJob = {
+      id: "j1",
+      name: "Daily Routine",
+      schedule: "0 0 8 * * *",
+      prompt: "go",
+      enabled: true,
+      type: "cron",
+      runCount: 0,
+      createdAt: new Date().toISOString(),
+      guaranteed: true,
+      dedicatedContext: true,
+      lastStatus: "error",
+    };
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    let execCount = 0;
+    pi.exec.mockImplementation(async () => {
+      execCount++;
+      return {
+        stdout: "",
+        stderr: "transient",
+        code: 0,
+        killed: false,
+      };
+    });
+    const scheduler = makeScheduler(storage, pi);
+
+    // start() registers Timer A for the error-state job.
+    scheduler.start();
+
+    // Simulate a parallel code path also scheduling a retry (e.g. cron tick fires,
+    // executeDedicatedJob runs, fails, and on the recurring-error branch schedules
+    // another retry). We just trigger the second scheduleRetryTimer directly.
+    (scheduler as any).scheduleRetryTimer(job.id);
+
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Only one retry-driven exec, not two.
+    expect(execCount).toBe(1);
+  });
+});
+
+// ---- formatDedicatedRunOutput: dedup of streaming events (Bug 4) ----
+//
+// Repro for the 197 MB schedule-prompts.json: when pi --mode json is killed
+// before agent_end (e.g. 5-min timeout), every streaming `message_update`
+// event carried a snapshot of the same logical assistant message with
+// growing thinking content. The fallback path naively pushed each snapshot,
+// so 5000 thinking deltas → 5000 `[thinking]` blocks → 27 MB output.
+
+describe("formatDedicatedRunOutput dedups streaming message_update events (Bug 4)", () => {
+  it("renders one [thinking] block, not N, when the same message streams via N message_update events", () => {
+    // Simulate streaming: one message_start, 100 message_update events (each carrying
+    // the same logical message with growing thinking content), no message_end (process killed).
+    const events: string[] = [];
+    events.push(JSON.stringify({ type: "agent_start" }));
+    events.push(JSON.stringify({
+      type: "message_start",
+      message: { role: "assistant", content: [] },
+    }));
+    for (let i = 1; i <= 100; i++) {
+      events.push(JSON.stringify({
+        type: "message_update",
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "thought ".repeat(i) }],
+        },
+        assistantMessageEvent: { type: "thinking_delta" },
+      }));
+    }
+    // No message_end, no agent_end — process was killed.
+    const stdout = events.join("\n");
+
+    const { output, hasAgentEnd } = formatDedicatedRunOutput(stdout, "", 143, true, 300);
+
+    expect(hasAgentEnd).toBe(false);
+    // Without the fix: 100 [thinking] headers. With the fix: exactly one.
+    const thinkingHeaders = (output.match(/\[thinking\]/g) ?? []).length;
+    expect(thinkingHeaders).toBe(1);
+    // The final state of the thinking text should be present.
+    expect(output).toContain("thought ".repeat(100).trim());
+  });
+
+  it("caps total output size to prevent storage bloat", () => {
+    // Synthesize a single message with 500 KB of thinking content. Even after
+    // dedup, this is too big to store; the cap must kick in.
+    const huge = "x".repeat(500_000);
+    const stdout = JSON.stringify({
+      type: "agent_end",
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: huge }],
+          stopReason: "stop",
+        },
+      ],
+    });
+    const { output } = formatDedicatedRunOutput(stdout, "", 0, false, 5);
+    // 64 KB cap + truncation suffix.
+    expect(output.length).toBeLessThan(70_000);
+    expect(output).toContain("[output truncated;");
+  });
+
+  it("preserves separate logical messages across multiple message_start events", () => {
+    // Two distinct assistant turns — both should be rendered.
+    const stdout = [
+      JSON.stringify({ type: "agent_start" }),
+      JSON.stringify({
+        type: "message_start",
+        message: { role: "assistant", content: [] },
+      }),
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "first turn" }],
+          stopReason: "stop",
+        },
+      }),
+      JSON.stringify({
+        type: "message_start",
+        message: { role: "assistant", content: [] },
+      }),
+      JSON.stringify({
+        type: "message_update",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "second turn (partial)" }],
+        },
+      }),
+      // No message_end for the second one — process killed.
+    ].join("\n");
+
+    const { output } = formatDedicatedRunOutput(stdout, "", 143, true, 300);
+    expect(output).toContain("first turn");
+    expect(output).toContain("second turn (partial)");
+  });
+});
+
+// ---- detectFailureHint: surface known causes to the user ----
+
+describe("detectFailureHint", () => {
+  it("returns null for output with no recognizable failure", () => {
+    expect(detectFailureHint("[exit=0 killed=false duration=2s]\n\n[assistant]\nDone.")).toBeNull();
+  });
+
+  it("flags a pi-guardrails 'no UI to confirm' block with the offending path", () => {
+    const out = "[exit=0]\n[result: bash (error)]\nAccess to /tmp/pi-bash-abc.log is blocked (outside working directory, no UI to confirm).";
+    const hint = detectFailureHint(out);
+    expect(hint).not.toBeNull();
+    expect(hint).toContain("/tmp/pi-bash-abc.log");
+    expect(hint).toContain("pathAccess.allowedPaths");
+    expect(hint).toContain("guardrails.json");
+  });
+
+  it("flags a generic pi-guardrails block (mode=block, not just ask)", () => {
+    const out = "Access to /etc/passwd is blocked (outside working directory).";
+    const hint = detectFailureHint(out);
+    expect(hint).toContain("/etc/passwd");
+    expect(hint).toContain("pathAccess");
+  });
+
+  it("flags a read-only filesystem error", () => {
+    const out = "[result: bash (error)]\ntouch: cannot touch '/home/x/foo': Read-only file system";
+    expect(detectFailureHint(out)).toMatch(/Read-only file system/);
+  });
+
+  it("flags model/network errors as transient", () => {
+    expect(detectFailureHint("Connection error.")).toMatch(/transient|retry/);
+    expect(detectFailureHint("ETIMEDOUT 10.0.0.1")).toMatch(/transient|retry/);
+  });
+
+  it("flags subprocess timeout when killed=true is in the diagnostic header", () => {
+    const out = "[exit=0 killed=true duration=300s]\n\n[user]\nlong prompt";
+    expect(detectFailureHint(out)).toMatch(/5-minute timeout/);
+  });
+
+  it("prefers the more specific guardrails hint over the generic timeout hint", () => {
+    // A run that's both killed and contains a guardrails block — guardrails is the
+    // actionable cause; the timeout is the symptom. The first match wins.
+    const out = "[exit=0 killed=true duration=300s]\n\n[result: write (error)]\nAccess to /tmp/foo is blocked (outside working directory, no UI to confirm).";
+    const hint = detectFailureHint(out);
+    expect(hint).toContain("guardrails");
+    expect(hint).not.toMatch(/5-minute timeout/);
+  });
+});
+
+// ---- renderMessages: shared formatter for non-dedicated jobs ----
+
+describe("renderMessages includes thinking + tool calls + tool results", () => {
+  it("includes assistant text, thinking, tool calls, and tool results", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "thought" },
+          { type: "text", text: "intro" },
+          { type: "toolCall", id: "t1", name: "Read", arguments: { path: "/x" } },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "t1",
+        toolName: "Read",
+        content: [{ type: "text", text: "data" }],
+        isError: false,
+      },
+      { role: "assistant", content: [{ type: "text", text: "final" }] },
+    ];
+    const out = renderMessages(messages);
+    expect(out).toContain("[thinking]");
+    expect(out).toContain("thought");
+    expect(out).toContain("intro");
+    expect(out).toContain("[tool: Read]");
+    expect(out).toContain("[result: Read]");
+    expect(out).toContain("data");
+    expect(out).toContain("final");
+  });
+
+  it("marks tool results as error when isError is true", () => {
+    const messages = [
+      {
+        role: "toolResult",
+        toolCallId: "t1",
+        toolName: "Bash",
+        content: [{ type: "text", text: "command failed" }],
+        isError: true,
+      },
+    ];
+    const out = renderMessages(messages);
+    expect(out).toContain("[result: Bash (error)]");
   });
 });

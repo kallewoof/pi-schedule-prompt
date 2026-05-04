@@ -134,7 +134,7 @@ export class CronStorage {
     const store = this.load();
     const history = store.runHistory ?? [];
     history.push(record);
-    if (history.length > 50) history.splice(0, history.length - 50);
+    if (history.length > 10) history.splice(0, history.length - 10);
     this.save({ ...store, runHistory: history });
   }
 
