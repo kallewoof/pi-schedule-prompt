@@ -56,6 +56,31 @@ Get prompted to do something once at a specific time:
 - ✓ **Safety features**: duplicate name prevention, infinite loop detection, past timestamp handling
 - ✓ **Context-aware routing**: in multi-context RPC mode, jobs fire back into the conversation that created them (e.g. the Signal thread or group)
 
+### Command mode (skip the agent)
+
+A large fraction of scheduled prompts don't need the agent at all — plain reminders, external sends, or script invocations. Pass `command: true` and the `prompt` field is executed as a shell command via `bash -c` instead of being sent to the agent as a user message.
+
+```
+"remind me to stretch in 10 minutes"
+  → schedule="+10m", prompt='echo "Time to stretch"', command=true
+
+"send me a Signal message every hour reminding me to drink water"
+  → schedule="1h", jobType=interval,
+    prompt='signal-cli -u +1234567890 send -m "Drink water" +1234567890',
+    command=true
+
+"run the nightly backup script at 3am"
+  → schedule="0 0 3 * * *", prompt='/usr/local/bin/backup.sh', command=true
+```
+
+- **stdout/stderr** are captured and surfaced as a notification in the session (visible inline), and stored in the run history for `/schedule-prompt replay <jobId>`.
+- **Timeout:** same 20-minute limit as dedicated-context jobs.
+- **Exit code:** non-zero → job marked `error`; `guaranteed=true` schedules a 10-minute retry.
+- **Mutually exclusive** with `dedicatedContext: true` — pick one isolation mode.
+- The recursive-scheduling block still applies on the caller side, but command jobs cannot themselves call any tools, so they cannot re-schedule.
+
+Prefer command mode whenever the task can be expressed as a one-liner; reserve the default (agent mode) for prompts that actually need the agent to reason, plan, or call tools.
+
 ### Context-aware routing (multi-context RPC mode)
 
 When pi runs in `--mode rpc` with named context sessions (used by bridges like [pi-signal-messenger](https://github.com/kallewoof/pi-signal-messenger) where each Signal thread or group is a separate context), `schedule_prompt` automatically captures `ctx.context` at job-creation time and stores it on the job as `targetContext`.

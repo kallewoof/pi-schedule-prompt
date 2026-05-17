@@ -263,10 +263,12 @@ export class CronWidget {
 
       // Guaranteed flag
       const guaranteedBadge = job.guaranteed ? theme.fg("warning", "⚡") : " ";
+      // Command-mode flag
+      const commandBadge = job.command ? theme.fg("accent", "$") : " ";
 
       // Combine into a row with proper spacing
       lines.push(
-        ` ${statusIcon}${guaranteedBadge} ${nameText} ${scheduleText} ${promptText} ${nextText} ${lastText} ${countText}`
+        ` ${statusIcon}${guaranteedBadge}${commandBadge} ${nameText} ${scheduleText} ${promptText} ${nextText} ${lastText} ${countText}`
       );
     }
 

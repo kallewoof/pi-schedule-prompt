@@ -18,7 +18,7 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "Schedule prompts at times/intervals. For action='add', provide schedule+prompt and optionally jobType ('cron'=recurring default, 'once'=single-shot, 'interval'=repeating). Schedule formats: 6-field cron ('0 * * * * *'=every minute), ISO timestamp, relative time (+10s,+5m,+1h), or interval (5m,1h). Actions: add(needs schedule+prompt), list, remove/enable/disable/update(need jobId), cleanup.",
+      "Schedule prompts at times/intervals. For action='add', provide schedule+prompt and optionally jobType ('cron'=recurring default, 'once'=single-shot, 'interval'=repeating). Schedule formats: 6-field cron ('0 * * * * *'=every minute), ISO timestamp, relative time (+10s,+5m,+1h), or interval (5m,1h). Actions: add(needs schedule+prompt), list, remove/enable/disable/update(need jobId), cleanup. Set command=true to run the prompt as a shell command via `bash -c` instead of invoking the agent — strongly preferred for plain reminders (use `echo \"do X\"`), Signal/email sends, and script runs. Reserve the default (command=false, agent mode) for prompts that actually need the agent to reason, plan, or call other tools.",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -55,6 +55,12 @@ export function createCronTool(
               if (!params.prompt) missing.push("'prompt'");
               throw new Error(
                 `Missing required parameters for add action: ${missing.join(" and ")}. You must provide both schedule (e.g., '+10s', '*/5 * * * * *') and prompt (the text to execute).`
+              );
+            }
+
+            if (params.command && params.dedicatedContext) {
+              throw new Error(
+                "command=true and dedicatedContext=true are mutually exclusive — use one or the other."
               );
             }
 
@@ -132,6 +138,7 @@ export function createCronTool(
               description: params.jobDescription,
               guaranteed: params.guaranteed ?? false,
               dedicatedContext: params.dedicatedContext ?? false,
+              command: params.command ?? false,
               targetContext: (ctx as any)?.context as string | undefined,
             };
 
@@ -145,7 +152,7 @@ export function createCronTool(
               content: [
                 {
                   type: "text",
-                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${formatSchedule(job.type, job.schedule)}\nPrompt: ${job.prompt}`,
+                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${formatSchedule(job.type, job.schedule)}\n${job.command ? "Command ($): " : "Prompt: "}${job.prompt}`,
                 },
               ],
               details,
@@ -264,7 +271,16 @@ export function createCronTool(
             if (params.jobDescription !== undefined) updates.description = params.jobDescription;
             if (params.guaranteed !== undefined) updates.guaranteed = params.guaranteed;
             if (params.dedicatedContext !== undefined) updates.dedicatedContext = params.dedicatedContext;
+            if (params.command !== undefined) updates.command = params.command;
             if (params.jobType) updates.type = params.jobType as CronJobType;
+
+            const effectiveCommand = updates.command ?? job.command ?? false;
+            const effectiveDedicated = updates.dedicatedContext ?? job.dedicatedContext ?? false;
+            if (effectiveCommand && effectiveDedicated) {
+              throw new Error(
+                "command=true and dedicatedContext=true are mutually exclusive — use one or the other."
+              );
+            }
 
             // Use the new type if being changed, otherwise keep existing
             const effectiveType = (updates.type ?? job.type) as CronJobType;
@@ -345,7 +361,7 @@ export function createCronTool(
 
               lines.push(`${status} ${job.name} (${job.id})`);
               lines.push(`  Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Schedule: ${formatSchedule(job.type, job.schedule)} | Guaranteed: ${job.guaranteed ? "yes" : "no"} | Dedicated: ${job.dedicatedContext ? "yes" : "no"}`);
-              lines.push(`  Prompt: ${job.prompt}`);
+              lines.push(`  ${job.command ? "Command ($): " : "Prompt: "}${job.prompt}`);
               lines.push(`  ${lastStr} ${nextStr ? `| ${nextStr}` : ""}`);
               lines.push(`  Runs: ${job.runCount} | Status: ${job.lastStatus || "pending"}`);
               if (job.description) {
@@ -438,7 +454,10 @@ export function createCronTool(
           lines.push(
             `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Recurring:")} ${recurringStr} ${theme.fg("dim", "| Schedule:")} ${formatSchedule(job.type, job.schedule)} ${theme.fg("dim", "| Guaranteed:")} ${guaranteedStr} ${theme.fg("dim", "| Dedicated:")} ${dedicatedStr}`
           );
-          lines.push(`  ${theme.fg("dim", "Prompt:")} ${job.prompt}`);
+          const promptLabel = job.command
+            ? theme.fg("accent", "Command ($):")
+            : theme.fg("dim", "Prompt:");
+          lines.push(`  ${promptLabel} ${job.prompt}`);
           if (job.lastRun) {
             lines.push(`  ${theme.fg("dim", "Last run:")} ${formatISOLocal(job.lastRun)}`);
           }

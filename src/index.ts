@@ -326,6 +326,41 @@ export default async function (pi: ExtensionAPI) {
     return container;
   });
 
+  pi.registerMessageRenderer("scheduled_prompt_command_end", (message, _options, theme) => {
+    const details = message.details as
+      | {
+          jobId: string;
+          jobName: string;
+          status: "success" | "error";
+          exitCode: number | null;
+          killed: boolean;
+          stdout: string;
+          stderr: string;
+          startTime?: string;
+          endTime?: string;
+        }
+      | undefined;
+    const container = new Container();
+    const success = details?.status === "success";
+    const icon = success ? theme.fg("success", "$") : theme.fg("error", "✗");
+    const name = details?.jobName ?? "command";
+    let durationS = 0;
+    if (details?.startTime && details?.endTime) {
+      durationS = Math.max(0, Math.round(
+        (new Date(details.endTime).getTime() - new Date(details.startTime).getTime()) / 1000
+      ));
+    }
+    const meta = success
+      ? `(${durationS}s)`
+      : `(exit=${details?.exitCode ?? "?"}${details?.killed ? ", killed" : ""}, ${durationS}s)`;
+    container.addChild(new Text(`${icon} ${theme.fg("text", name)} ${theme.fg("dim", meta)}`, 0, 0));
+    const stdout = details?.stdout ?? "";
+    const stderr = details?.stderr ?? "";
+    if (stdout) container.addChild(new Text(stdout, 0, 0));
+    if (stderr) container.addChild(new Text(theme.fg("warning", stderr), 0, 0));
+    return container;
+  });
+
   // Register the tool once with getter functions.
   // Lazy-init storage/scheduler so the tool works in --mode rpc where session_start never fires.
   const getStorage = () => {
@@ -467,7 +502,7 @@ export default async function (pi: ExtensionAPI) {
             const status = job.enabled ? "✓" : "✗";
             lines.push(`${status} ${job.name} (${job.id})`);
             lines.push(`  Schedule: ${formatSchedule(job.type, job.schedule)} | Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Guaranteed: ${job.guaranteed ? "yes" : "no"} | Dedicated: ${job.dedicatedContext ? "yes" : "no"}`);
-            lines.push(`  Prompt: ${job.prompt}`);
+            lines.push(`  ${job.command ? "Command ($): " : "Prompt: "}${job.prompt}`);
             if (nextRun) {
               const hint = formatRelativeHint(nextRun);
               lines.push(`  Next run: ${formatLocalDateTime(nextRun)}${hint ? ` (${hint})` : ""}`);

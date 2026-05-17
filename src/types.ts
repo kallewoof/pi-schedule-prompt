@@ -48,6 +48,8 @@ export interface CronJob {
   targetContext?: string;
   /** If true, run prompt in a fresh blank subprocess context; main session receives only start/end notifications */
   dedicatedContext?: boolean;
+  /** If true, the prompt is executed as a shell command via `bash -c` instead of being sent to the agent. Mutually exclusive with dedicatedContext. */
+  command?: boolean;
 }
 
 /**
@@ -138,6 +140,12 @@ export const CronToolParams = Type.Object({
     Type.Boolean({
       description:
         "If true, run the prompt in a blank dedicated subprocess context. The current session receives only start/end notifications; full output is viewable via /schedule-prompt replay.",
+    })
+  ),
+  command: Type.Optional(
+    Type.Boolean({
+      description:
+        "If true, the prompt is executed as a shell command via `bash -c` instead of being sent to the agent. Use for reminders (`echo \"do X\"`), external side-effects (`signal-cli send ...`), or script runs — anything that doesn't need agent reasoning. Output is shown as a notification and captured for /schedule-prompt replay. Mutually exclusive with dedicatedContext.",
     })
   ),
 });

@@ -21,14 +21,31 @@ export class CronStorage {
     try {
       if (fs.existsSync(this.storePath)) {
         const data = fs.readFileSync(this.storePath, "utf-8");
-        const store = JSON.parse(data) as CronStore;
-        return store;
+        try {
+          return JSON.parse(data) as CronStore;
+        } catch (parseError) {
+          // The file exists but is unparseable. Returning an empty store here
+          // would let the very next save() (e.g. recording a run) overwrite
+          // the corrupt file with `{ jobs: [] }` and permanently erase every
+          // scheduled job. Move the bad file aside so the original content is
+          // preserved for manual recovery before falling through to empty.
+          const backupPath = `${this.storePath}.corrupt-${Date.now()}`;
+          try {
+            fs.renameSync(this.storePath, backupPath);
+            console.error(
+              `Failed to parse scheduled prompts (${(parseError as Error).message}). ` +
+                `Moved corrupt file aside as ${backupPath} for manual recovery.`
+            );
+          } catch (renameError) {
+            console.error("Failed to back up corrupt scheduled prompts:", renameError);
+          }
+        }
       }
     } catch (error) {
       console.error("Failed to load scheduled prompts:", error);
     }
 
-    // Return empty store if file doesn't exist or is corrupted
+    // Return empty store if file doesn't exist (or was corrupt and moved aside)
     return { jobs: [], version: 1 };
   }
 

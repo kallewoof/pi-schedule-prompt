@@ -44,20 +44,36 @@ interface InFlightEntry {
 const inFlightDedicated = new Map<string, InFlightEntry>();
 const pendingDedicatedRetriesGlobal = new Set<string>();
 
-/** Snapshot of dedicated-job activity for `/schedule-prompt ps`. */
+/**
+ * Module-scope tracking of in-flight command-mode subprocesses. Parallel to
+ * `inFlightDedicated`; kept separate so the dedicated-only guards in
+ * `runJobNow` / `start()` don't accidentally see command jobs as dedicated
+ * and skip-fire them through the wrong path.
+ */
+const inFlightCommand = new Map<string, InFlightEntry>();
+const pendingCommandRetriesGlobal = new Set<string>();
+
+/** Snapshot of background-job activity for `/schedule-prompt ps`. */
 export interface DedicatedActivity {
   inFlight: ReadonlyArray<{ jobId: string; jobName: string; prompt: string; startTime: string }>;
   queuedRetries: ReadonlyArray<string>;
 }
 
 export function getDedicatedActivity(): DedicatedActivity {
-  const inFlight = Array.from(inFlightDedicated.values()).map((e) => ({
+  const inFlight = [
+    ...Array.from(inFlightDedicated.values()),
+    ...Array.from(inFlightCommand.values()),
+  ].map((e) => ({
     jobId: e.jobId,
     jobName: e.jobName,
     prompt: e.prompt,
     startTime: e.startTime,
   }));
-  return { inFlight, queuedRetries: Array.from(pendingDedicatedRetriesGlobal) };
+  const queuedRetries = [
+    ...Array.from(pendingDedicatedRetriesGlobal),
+    ...Array.from(pendingCommandRetriesGlobal),
+  ];
+  return { inFlight, queuedRetries };
 }
 
 type DeferredAction = { type: "send"; job: CronJob } | { type: "retry"; jobId: string };
@@ -142,6 +158,10 @@ export class CronScheduler {
       // The natural cron tick (or its own pendingDedicatedRetriesGlobal hook)
       // will handle re-firing once that subprocess finishes.
       if (job.dedicatedContext && inFlightDedicated.has(job.id)) {
+        if (job.type !== "once") this.scheduleJob(job);
+        continue;
+      }
+      if (job.command && inFlightCommand.has(job.id)) {
         if (job.type !== "once") this.scheduleJob(job);
         continue;
       }
@@ -237,10 +257,15 @@ export class CronScheduler {
       }
       inFlightDedicated.clear();
       pendingDedicatedRetriesGlobal.clear();
+      for (const entry of inFlightCommand.values()) {
+        entry.controller.abort();
+      }
+      inFlightCommand.clear();
+      pendingCommandRetriesGlobal.clear();
     }
-    // On session-replace: leave inFlightDedicated and pendingDedicatedRetriesGlobal
-    // alone so the old subprocess can run to completion and any user-queued
-    // retry survives the swap.
+    // On session-replace: leave inFlightDedicated, inFlightCommand and their
+    // pending-retry sets alone so old subprocesses run to completion and any
+    // user-queued retry survives the swap.
   }
 
   addJob(job: CronJob): void {
@@ -658,11 +683,24 @@ export class CronScheduler {
       pendingDedicatedRetriesGlobal.add(jobId);
       return "queued";
     }
+    if (job.command && inFlightCommand.has(jobId)) {
+      // Same survival logic as dedicated jobs above — a command run that
+      // outlived a session swap will re-fire itself on completion.
+      pendingCommandRetriesGlobal.add(jobId);
+      return "queued";
+    }
     await this.executeJobIfLeader(job);
     return "fired";
   }
 
   private async executeJobIfLeader(job: CronJob): Promise<void> {
+    if (job.command) {
+      // Shell command — runs in a child process, never invokes the agent.
+      // Does not touch agentRunning/sending/retrying gating since there's no
+      // shared agent context to protect.
+      void this.executeCommandJob(job);
+      return;
+    }
     if (job.dedicatedContext) {
       // Runs in an isolated subprocess — does not block the main agent.
       void this.executeDedicatedJob(job);
@@ -855,6 +893,10 @@ export class CronScheduler {
     const current = this.storage.getJob(jobId);
     if (!current || !current.enabled || !current.guaranteed) return;
 
+    if (current.command) {
+      void this.executeCommandJob(current);
+      return;
+    }
     if (current.dedicatedContext) {
       void this.executeDedicatedJob(current);
       return;
@@ -1079,6 +1121,162 @@ export class CronScheduler {
     }
   }
 
+  /**
+   * Execute a command-mode job: run `bash -c <prompt>` in a child process,
+   * notify start/end with captured stdout/stderr, and record the run for replay.
+   * Does NOT route through the agent — command jobs are pure side-effects
+   * (reminders via `echo`, external sends, script runs, etc.) and never block
+   * or interleave with main-session gating (`sending`/`agentRunning`/`retrying`).
+   */
+  private async executeCommandJob(job: CronJob): Promise<void> {
+    // Cross-instance dedup — same reasoning as executeDedicatedJob.
+    if (inFlightCommand.has(job.id)) return;
+
+    const startTime = new Date().toISOString();
+    const controller = new AbortController();
+    inFlightCommand.set(job.id, {
+      controller,
+      jobId: job.id,
+      jobName: job.name,
+      prompt: job.prompt,
+      startTime,
+    });
+
+    const piAny = this.pi as any;
+    const notifyToContext =
+      job.targetContext &&
+      typeof piAny.sendMessageToContext === "function";
+
+    // Same notification discipline as executeDedicatedJob — see the lengthy
+    // rationale on its `notify` helper. Reproduced here so command-mode
+    // notifications can't accidentally steer an active agent turn or throw
+    // on a stale ctx after session_shutdown.
+    const notify = (customType: string, text: string, details: Record<string, unknown>) => {
+      if (this.stopped) return;
+      const msg = {
+        customType,
+        content: [{ type: "text" as const, text }],
+        display: true,
+        details,
+      };
+      const opts = this.agentRunning ? { deliverAs: "nextTurn" as const } : {};
+      try {
+        if (notifyToContext) {
+          piAny.sendMessageToContext(job.targetContext, msg, opts);
+        } else {
+          this.pi.sendMessage(msg, opts);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!/stale after session replacement|extension ctx is stale/i.test(message)) {
+          throw err;
+        }
+      }
+    };
+
+    // No begin notification for command jobs — they're typically short and
+    // the running state is already visible in the widget (status: running)
+    // and /schedule-prompt ps. A separate begin message just adds noise.
+    this.storage.updateJob(job.id, { lastStatus: "running" });
+    this.emitChange({ type: "fire", job });
+
+    let status: "success" | "error" = "success";
+    let output = "";
+    let stdout = "";
+    let stderr = "";
+    let exitCode: number | null = null;
+    let killed = false;
+    const startMs = Date.now();
+
+    try {
+      const result = await this.pi.exec(
+        "bash",
+        ["-c", job.prompt],
+        { signal: controller.signal, timeout: DEDICATED_JOB_TIMEOUT_MS }
+      );
+      const durationS = Math.round((Date.now() - startMs) / 1000);
+      stdout = result.stdout;
+      stderr = result.stderr;
+      exitCode = result.code;
+      killed = result.killed;
+      output = formatCommandRunOutput(stdout, stderr, exitCode, killed, durationS);
+      status = exitCode === 0 && !killed ? "success" : "error";
+    } catch (error) {
+      if ((error as Error & { name?: string }).name === "AbortError") {
+        // Scheduler stopped on host quit — exit without updating storage.
+        inFlightCommand.delete(job.id);
+        return;
+      }
+      const durationS = Math.round((Date.now() - startMs) / 1000);
+      const errMsg = error instanceof Error ? error.message : String(error);
+      stderr = errMsg;
+      output = `[exit=? killed=? duration=${durationS}s]\n[error]\n${errMsg}`;
+      status = "error";
+    } finally {
+      inFlightCommand.delete(job.id);
+    }
+
+    this.captureRunRecordFromOutput(job, output, status, startTime);
+
+    if (job.type === "once") {
+      if (status === "success" || !job.guaranteed) {
+        this.storage.removeJob(job.id);
+        this.emitChange({ type: "remove", jobId: job.id });
+      } else {
+        this.storage.updateJob(job.id, { lastStatus: "error" });
+        this.emitChange({ type: "error", jobId: job.id, error: "Command failed (retrying in 10m)" });
+        this.scheduleRetryTimer(job.id);
+      }
+    } else {
+      const nextRun = this.getNextRun(job.id);
+      this.storage.updateJob(job.id, {
+        lastRun: new Date().toISOString(),
+        lastStatus: status,
+        runCount: job.runCount + 1,
+        nextRun: nextRun?.toISOString(),
+      });
+      this.emitChange({ type: "fire", job });
+      if (status === "error" && job.guaranteed) {
+        this.scheduleRetryTimer(job.id);
+      }
+    }
+
+    // Silent-success: if the command exited 0 with no stdout or stderr,
+    // skip the notification entirely. Frequent housekeeping jobs ("nothing
+    // to do") shouldn't spam the session. Run history still records the run,
+    // and /schedule-prompt replay can surface it on demand.
+    const trimmedStdout = stdout.replace(/\s+$/, "");
+    const trimmedStderr = stderr.replace(/\s+$/, "");
+    const shouldNotify = status === "error" || trimmedStdout !== "" || trimmedStderr !== "";
+    if (shouldNotify) {
+      // Body is a fallback for hosts that don't render via the registered
+      // `scheduled_prompt_command_end` renderer. The renderer reads the
+      // structured fields in `details` for a streamlined display.
+      const endTime = new Date().toISOString();
+      notify(
+        "scheduled_prompt_command_end",
+        output,
+        {
+          jobId: job.id,
+          jobName: job.name,
+          status,
+          exitCode,
+          killed,
+          stdout: trimmedStdout,
+          stderr: trimmedStderr,
+          startTime,
+          endTime,
+        }
+      );
+    }
+
+    if (pendingCommandRetriesGlobal.has(job.id)) {
+      pendingCommandRetriesGlobal.delete(job.id);
+      const fresh = this.storage.getJob(job.id) ?? job;
+      void this.executeCommandJob(fresh);
+    }
+  }
+
   private captureRunRecordFromOutput(
     job: CronJob,
     output: string,
@@ -1255,6 +1453,27 @@ export class CronScheduler {
  * Always emits a diagnostic header so empty/timeout runs aren't blank.
  * Parses `pi --mode json` JSONL stdout to render thinking, tool calls, and tool results.
  */
+/**
+ * Format command-mode run output for notifications and run history.
+ * Plain bash stdout/stderr — no JSON parsing or message reconstruction.
+ */
+export function formatCommandRunOutput(
+  stdout: string,
+  stderr: string,
+  code: number,
+  killed: boolean,
+  durationS: number
+): string {
+  const header = `[exit=${code} killed=${killed} duration=${durationS}s]`;
+  const sections: string[] = [header];
+  const out = stdout.replace(/\s+$/, "");
+  const err = stderr.replace(/\s+$/, "");
+  if (out) sections.push(`[stdout]\n${out}`);
+  if (err) sections.push(`[stderr]\n${err}`);
+  if (!out && !err) sections.push("(no output)");
+  return sections.join("\n");
+}
+
 export function formatDedicatedRunOutput(
   stdout: string,
   stderr: string,
