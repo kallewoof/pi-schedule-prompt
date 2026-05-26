@@ -53,6 +53,58 @@ const pendingDedicatedRetriesGlobal = new Set<string>();
 const inFlightCommand = new Map<string, InFlightEntry>();
 const pendingCommandRetriesGlobal = new Set<string>();
 
+/**
+ * Host-wide single-slot queue for dedicated + command subprocesses.
+ *
+ * Without this, two cron jobs whose schedules land on the same minute (e.g.
+ * two daily routines both at 22:42) each spawn a full `pi --mode json`
+ * subprocess in parallel. Two concurrent agents talking to the model
+ * provider exhaust API quota and frequently produce coordinated failures
+ * (timeouts, rate-limit storms) — and any shared-file outputs they touch
+ * (e.g. both writing to REPORTS/YYYY-MM-DD.md) lose data via interleaved
+ * read-modify-write.
+ *
+ * The queue is module-scope (not per-scheduler) so it survives session
+ * swaps the same way `inFlightDedicated` does. `activeScheduler` is the
+ * live scheduler instance that should dispatch drained items; an old
+ * scheduler whose subprocess completes after a /new will route the drain
+ * through the new scheduler's `pi` rather than its own stale one.
+ *
+ * Items are kept as jobIds (not full CronJob snapshots) because the job's
+ * prompt or enabled flag may have changed in storage between enqueue and
+ * dispatch — we re-read at drain time.
+ */
+type SubprocessKind = "dedicated" | "command";
+type SubprocessQueueEntry = { kind: SubprocessKind; jobId: string };
+const subprocessQueue: SubprocessQueueEntry[] = [];
+let activeScheduler: CronScheduler | null = null;
+
+function isSubprocessSlotBusy(): boolean {
+  return inFlightDedicated.size > 0 || inFlightCommand.size > 0;
+}
+
+/** Snapshot of the global subprocess queue for `/schedule-prompt ps`. */
+export function getQueuedSubprocessJobIds(): ReadonlyArray<string> {
+  return subprocessQueue.map((e) => e.jobId);
+}
+
+/**
+ * Test-only: wipe all module-scope subprocess state. Tests share this module
+ * across cases (the in-flight maps and queue are module-scope so they can
+ * survive session swaps in production), so they need an explicit reset to
+ * avoid one test's leftover entries blocking another from firing.
+ */
+export function __resetSubprocessStateForTests(): void {
+  for (const entry of inFlightDedicated.values()) entry.controller.abort();
+  inFlightDedicated.clear();
+  pendingDedicatedRetriesGlobal.clear();
+  for (const entry of inFlightCommand.values()) entry.controller.abort();
+  inFlightCommand.clear();
+  pendingCommandRetriesGlobal.clear();
+  subprocessQueue.length = 0;
+  activeScheduler = null;
+}
+
 /** Snapshot of background-job activity for `/schedule-prompt ps`. */
 export interface DedicatedActivity {
   inFlight: ReadonlyArray<{ jobId: string; jobName: string; prompt: string; startTime: string }>;
@@ -72,6 +124,7 @@ export function getDedicatedActivity(): DedicatedActivity {
   const queuedRetries = [
     ...Array.from(pendingDedicatedRetriesGlobal),
     ...Array.from(pendingCommandRetriesGlobal),
+    ...subprocessQueue.map((e) => e.jobId),
   ];
   return { inFlight, queuedRetries };
 }
@@ -81,6 +134,14 @@ type DeferredAction = { type: "send"; job: CronJob } | { type: "retry"; jobId: s
 export class CronScheduler {
   private jobs = new Map<string, Cron>();
   private intervals = new Map<string, NodeJS.Timeout>();
+  /**
+   * Per-job `setInterval` start time (ms). For interval jobs, the timer
+   * actually fires at `anchor + intervalMs`, which can differ from
+   * `lastRun + intervalMs` after a missed-on-restart drop where `lastRun`
+   * was never advanced. `getNextRun` consults this anchor so the displayed
+   * "Next run" matches the live timer instead of a long-elapsed value.
+   */
+  private intervalAnchors = new Map<string, number>();
   private retries = new Map<string, NodeJS.Timeout>();
   /** Job IDs for guaranteed once-jobs that have been sent but not yet confirmed by agent_end. FIFO. */
   private pendingGuaranteedOnce: string[] = [];
@@ -147,6 +208,7 @@ export class CronScheduler {
 
   start(): void {
     this.stopped = false;
+    activeScheduler = this;
     const allJobs = this.storage.getAllJobs();
     const now = new Date();
 
@@ -191,13 +253,25 @@ export class CronScheduler {
           });
           this.emitChange({ type: "error", jobId: job.id, error: "Missed one-time job (not guaranteed)" });
         } else {
-          // Recurring job: silently drop the missed execution, resume normal schedule
+          // Recurring job (interval/cron): fire the missed execution once now,
+          // then resume normal cadence. A non-guaranteed interval job that
+          // should have fired 20h ago should run at the soonest opportunity
+          // rather than wait another full cadence — otherwise pi being offline
+          // silently turns a job into ~1.5x its declared interval.
+          // `guaranteed` still controls in-session retry behaviour (model errors,
+          // unconfirmed sends), just not the "catch up the missed tick" decision.
+          void this.executeJobIfLeader(job);
           this.scheduleJob(job);
         }
       } else {
         this.scheduleJob(job);
       }
     }
+
+    // Drain any queue entries left behind by a prior scheduler instance
+    // (e.g. items enqueued in the old scheduler that hadn't dispatched yet
+    // when the session swapped). Safe no-op when the queue is empty.
+    this.drainSubprocessQueue();
   }
 
   /**
@@ -224,6 +298,7 @@ export class CronScheduler {
       clearInterval(interval);
     }
     this.intervals.clear();
+    this.intervalAnchors.clear();
 
     for (const retry of this.retries.values()) {
       clearTimeout(retry);
@@ -262,6 +337,10 @@ export class CronScheduler {
       }
       inFlightCommand.clear();
       pendingCommandRetriesGlobal.clear();
+      subprocessQueue.length = 0;
+    }
+    if (activeScheduler === this) {
+      activeScheduler = null;
     }
     // On session-replace: leave inFlightDedicated, inFlightCommand and their
     // pending-retry sets alone so old subprocesses run to completion and any
@@ -306,6 +385,16 @@ export class CronScheduler {
       return target;
     }
     if (job.type === "interval" && job.intervalMs) {
+      // Prefer the live setInterval anchor: when start() re-arms a missed
+      // non-guaranteed job, lastRun is intentionally not advanced (the run
+      // didn't happen), so lastRun + intervalMs is in the past — but the
+      // timer will fire at anchor + intervalMs. After that first fire,
+      // lastRun catches up and the anchor falls out of relevance.
+      const anchor = this.intervalAnchors.get(jobId);
+      const nowMs = Date.now();
+      if (anchor !== undefined && anchor + job.intervalMs > nowMs) {
+        return new Date(anchor + job.intervalMs);
+      }
       const base = job.lastRun ? new Date(job.lastRun).getTime() : new Date(job.createdAt).getTime();
       if (isNaN(base)) return null;
       return new Date(base + job.intervalMs);
@@ -551,6 +640,7 @@ export class CronScheduler {
   private scheduleJob(job: CronJob): void {
     try {
       if (job.type === "interval" && job.intervalMs) {
+        this.intervalAnchors.set(job.id, Date.now());
         const interval = setInterval(() => {
           void this.executeJobIfLeader(job);
         }, job.intervalMs);
@@ -633,6 +723,7 @@ export class CronScheduler {
       clearInterval(interval);
       this.intervals.delete(id);
     }
+    this.intervalAnchors.delete(id);
 
     const retry = this.retries.get(id);
     if (retry) {
@@ -648,6 +739,12 @@ export class CronScheduler {
     this.deferredActions = this.deferredActions.filter(
       (a) => (a.type === "send" ? a.job.id : a.jobId) !== id
     );
+
+    // Drop any queued subprocess entries for this job; the drain loop would
+    // otherwise re-read storage, find it gone, and skip — wasted churn.
+    for (let i = subprocessQueue.length - 1; i >= 0; i--) {
+      if (subprocessQueue[i].jobId === id) subprocessQueue.splice(i, 1);
+    }
 
     // If we were retrying this job, unblock so other deferred actions can proceed.
     if (this.retryingJobId === id) {
@@ -689,21 +786,92 @@ export class CronScheduler {
       pendingCommandRetriesGlobal.add(jobId);
       return "queued";
     }
+    if (job.dedicatedContext) {
+      return this.enqueueOrRunSubprocess("dedicated", job) === "fired" ? "fired" : "queued";
+    }
+    if (job.command) {
+      return this.enqueueOrRunSubprocess("command", job) === "fired" ? "fired" : "queued";
+    }
     await this.executeJobIfLeader(job);
     return "fired";
+  }
+
+  /**
+   * Add a dedicated/command job to the host-wide subprocess queue, or run it
+   * immediately if the slot is free.
+   *
+   * Returns:
+   *   - "fired"  — slot was free; the executor was invoked synchronously
+   *   - "queued" — slot is busy or this job is already queued; will run later
+   *   - "skipped" — this exact job is already in flight (cross-instance dedup)
+   *
+   * Same-job dedup matters because a stray duplicate enqueue (e.g. start()
+   * re-firing a missed job that's already in the queue) would otherwise leave
+   * two queue entries that both fire and the second would no-op on the
+   * `inFlightDedicated.has(...)` guard inside the executor anyway. Cleaner to
+   * dedup at enqueue time.
+   */
+  private enqueueOrRunSubprocess(kind: SubprocessKind, job: CronJob): "fired" | "queued" | "skipped" {
+    // Claim active-scheduler slot if no one has yet (e.g. tests that invoke
+    // dispatchers without calling start()). Production always sets this in
+    // start(); this fallback just makes the implicit lifecycle work.
+    if (activeScheduler === null) activeScheduler = this;
+
+    const inFlight = kind === "dedicated" ? inFlightDedicated : inFlightCommand;
+    if (inFlight.has(job.id)) return "skipped";
+    if (subprocessQueue.some((e) => e.jobId === job.id)) return "queued";
+
+    if (isSubprocessSlotBusy()) {
+      subprocessQueue.push({ kind, jobId: job.id });
+      this.emitChange({ type: "fire", job });
+      return "queued";
+    }
+    if (kind === "dedicated") {
+      void this.executeDedicatedJob(job);
+    } else {
+      void this.executeCommandJob(job);
+    }
+    return "fired";
+  }
+
+  /**
+   * Pop and dispatch the next queued subprocess job, if the slot is free.
+   * Loops until the slot becomes busy (the dispatched job sets inFlight
+   * synchronously before its first await) or the queue empties.
+   *
+   * Routes dispatch through `activeScheduler` rather than `this`: when the
+   * old scheduler's subprocess completes after a /new, its `this.pi` is
+   * stale — the new scheduler is the one that should fire the next job.
+   */
+  private drainSubprocessQueue(): void {
+    while (!isSubprocessSlotBusy()) {
+      const sched = activeScheduler;
+      if (!sched) return;
+      const next = subprocessQueue.shift();
+      if (!next) return;
+      const fresh = sched.storage.getJob(next.jobId);
+      if (!fresh || !fresh.enabled) continue;
+      if (next.kind === "dedicated") {
+        void sched.executeDedicatedJob(fresh);
+      } else {
+        void sched.executeCommandJob(fresh);
+      }
+    }
   }
 
   private async executeJobIfLeader(job: CronJob): Promise<void> {
     if (job.command) {
       // Shell command — runs in a child process, never invokes the agent.
-      // Does not touch agentRunning/sending/retrying gating since there's no
-      // shared agent context to protect.
-      void this.executeCommandJob(job);
+      // Routed through the host-wide subprocess queue so it doesn't run in
+      // parallel with another dedicated or command subprocess.
+      this.enqueueOrRunSubprocess("command", job);
       return;
     }
     if (job.dedicatedContext) {
-      // Runs in an isolated subprocess — does not block the main agent.
-      void this.executeDedicatedJob(job);
+      // Runs in an isolated subprocess — does not block the main agent, but
+      // is host-serialized against other dedicated/command runs to keep API
+      // load and shared-file contention under control.
+      this.enqueueOrRunSubprocess("dedicated", job);
       return;
     }
     if (this.agentRunning || this.retrying || this.sending) {
@@ -894,11 +1062,11 @@ export class CronScheduler {
     if (!current || !current.enabled || !current.guaranteed) return;
 
     if (current.command) {
-      void this.executeCommandJob(current);
+      this.enqueueOrRunSubprocess("command", current);
       return;
     }
     if (current.dedicatedContext) {
-      void this.executeDedicatedJob(current);
+      this.enqueueOrRunSubprocess("dedicated", current);
       return;
     }
 
@@ -1118,7 +1286,14 @@ export class CronScheduler {
       pendingDedicatedRetriesGlobal.delete(job.id);
       const fresh = this.storage.getJob(job.id) ?? job;
       void this.executeDedicatedJob(fresh);
+      return;
     }
+
+    // Slot is free — drain the next queued job (if any). This is what keeps
+    // jobs whose schedules collided from running in parallel: rather than
+    // both spawning subprocesses simultaneously, the second one waits in the
+    // queue and starts here.
+    this.drainSubprocessQueue();
   }
 
   /**
@@ -1274,7 +1449,12 @@ export class CronScheduler {
       pendingCommandRetriesGlobal.delete(job.id);
       const fresh = this.storage.getJob(job.id) ?? job;
       void this.executeCommandJob(fresh);
+      return;
     }
+
+    // Slot is free — drain the next queued job. See executeDedicatedJob's
+    // matching call for the rationale.
+    this.drainSubprocessQueue();
   }
 
   private captureRunRecordFromOutput(

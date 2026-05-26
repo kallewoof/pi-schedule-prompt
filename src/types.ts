@@ -42,7 +42,7 @@ export interface CronJob {
   runCount: number;
   /** Optional description */
   description?: string;
-  /** If true, run missed jobs immediately on startup; if false (default), drop missed recurring or mark missed one-time as failed */
+  /** Retry semantics for transient failures. Recurring jobs always catch up a missed tick on startup regardless of this flag; `guaranteed` additionally enables in-session retries on model errors and unconfirmed sends, and (for once-jobs) re-fires a missed prompt instead of marking it failed. */
   guaranteed?: boolean;
   /** RPC context name to route the fired response to (e.g. Signal thread or group); undefined = main session */
   targetContext?: string;
@@ -133,7 +133,7 @@ export const CronToolParams = Type.Object({
   guaranteed: Type.Optional(
     Type.Boolean({
       description:
-        "If true, run missed jobs immediately on startup. If false (default), silently drop missed recurring jobs or mark missed one-time jobs as failed.",
+        "Retry semantics for transient failures. Recurring jobs always catch up a missed tick on startup regardless of this flag. If true, additionally retry in-session on model errors / unconfirmed sends, and (for once-jobs) re-fire a missed prompt rather than marking it failed.",
     })
   ),
   dedicatedContext: Type.Optional(

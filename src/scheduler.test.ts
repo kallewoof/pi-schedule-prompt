@@ -5,6 +5,7 @@ import {
   formatDedicatedRunOutput,
   getDedicatedActivity,
   renderMessages,
+  __resetSubprocessStateForTests,
 } from "./scheduler.js";
 import type { CronJob } from "./types.js";
 
@@ -85,6 +86,10 @@ beforeEach(() => {
   vi.useFakeTimers();
   // Bypass leader election so executeJobIfLeader resolves immediately in tests.
   vi.spyOn(CronScheduler.prototype as any, "acquireLeadership").mockResolvedValue(true);
+  // Module-scope subprocess state leaks across tests otherwise — a hanging
+  // `pi.exec` mock from a prior case keeps the slot "busy" and silently queues
+  // every subsequent dispatch instead of firing it.
+  __resetSubprocessStateForTests();
 });
 
 afterEach(() => {
@@ -732,6 +737,115 @@ describe("isMissed restart recovery for guaranteed once-jobs", () => {
       guaranteed: false,
     });
     expect(isMissed(scheduler, job)).toBe(true);
+  });
+});
+
+// ---- start(): missed non-guaranteed recurring jobs catch up on restart ----
+//
+// Repro for the user's observation: two interval jobs (30m) showed "Next run:
+// 12:49" at 14:58, hours after the next-scheduled time elapsed. Pi was offline
+// when those fires were due. The original behaviour silently dropped the
+// missed execution and re-armed a fresh setInterval — so an interval declared
+// as "every 30 minutes" effectively becomes ~30m + offline-duration on the
+// restart cycle. For a job that should have fired 20h ago, the correct
+// response is to fire it once now and resume the cadence, not wait another
+// full interval.
+//
+// The `guaranteed` flag still distinguishes in-session retry semantics on
+// transient model errors / unconfirmed sends; it just no longer gates the
+// "catch up a missed tick" decision.
+
+describe("start(): missed non-guaranteed recurring jobs catch up on restart", () => {
+  it("fires a missed non-guaranteed interval job once on startup", async () => {
+    const now = Date.now();
+    // lastRun was 2h ago, intervalMs = 30m → 3 fires were missed.
+    const job: CronJob = {
+      id: "interval-1",
+      name: "Half-hourly",
+      schedule: "30m",
+      prompt: "ping",
+      enabled: true,
+      type: "interval",
+      intervalMs: 30 * 60 * 1000,
+      runCount: 4,
+      createdAt: new Date(now - 4 * 60 * 60 * 1000).toISOString(),
+      lastRun: new Date(now - 2 * 60 * 60 * 1000).toISOString(),
+      lastStatus: "success",
+      guaranteed: false,
+    };
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    // Drain microtasks: executeJobIfLeader → acquireLeadership (mocked resolved) → executeJob.
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("getNextRun returns a future time after start() processes a missed interval job", async () => {
+    const now = Date.now();
+    const intervalMs = 30 * 60 * 1000;
+    const job: CronJob = {
+      id: "interval-2",
+      name: "Half-hourly",
+      schedule: "30m",
+      prompt: "ping",
+      enabled: true,
+      type: "interval",
+      intervalMs,
+      runCount: 4,
+      createdAt: new Date(now - 4 * 60 * 60 * 1000).toISOString(),
+      lastRun: new Date(now - 2 * 60 * 60 * 1000).toISOString(),
+      lastStatus: "success",
+      guaranteed: false,
+    };
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const next = scheduler.getNextRun(job.id);
+    expect(next).not.toBeNull();
+    // The displayed "Next run" must point at the freshly-armed timer's first
+    // fire (≈ now + intervalMs), not the long-elapsed pre-restart cadence.
+    expect(next!.getTime()).toBeGreaterThan(now);
+  });
+
+  it("does not fire a non-guaranteed interval job that is NOT yet missed", async () => {
+    // Guard against catching-up a job whose next tick is still in the future.
+    const now = Date.now();
+    const intervalMs = 30 * 60 * 1000;
+    const job: CronJob = {
+      id: "interval-3",
+      name: "Half-hourly",
+      schedule: "30m",
+      prompt: "ping",
+      enabled: true,
+      type: "interval",
+      intervalMs,
+      runCount: 4,
+      createdAt: new Date(now - 60 * 60 * 1000).toISOString(),
+      // lastRun = 5m ago → next tick is in 25m → not missed.
+      lastRun: new Date(now - 5 * 60 * 1000).toISOString(),
+      lastStatus: "success",
+      guaranteed: false,
+    };
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 });
 
@@ -1557,9 +1671,13 @@ describe("runJobNow (public API for /schedule-prompt retry)", () => {
     }
   });
 
-  it("retrying a DIFFERENT dedicated job while one is still in-flight does NOT abort the running one", async () => {
-    // User's scenario: dedicated job A is running. User does /schedule-prompt retry B.
-    // Both must run as independent subprocesses; A's AbortController must NOT be triggered.
+  it("retrying a DIFFERENT dedicated job while one is still in-flight queues it (no parallel exec) without aborting the running one", async () => {
+    // Dedicated/command subprocesses are host-serialized: only one runs at a
+    // time. Two daily routines scheduled for the same minute would otherwise
+    // hammer the model provider in parallel and race on any shared output
+    // files. The second job waits in the queue until the first finishes;
+    // meanwhile the running job's AbortController must NOT be triggered by
+    // the enqueue.
     const jobA = makeJob({ id: "A", dedicatedContext: true });
     const jobB = makeJob({ id: "B", dedicatedContext: true });
     const storage = makeMockStorage([jobA, jobB]);
@@ -1590,17 +1708,16 @@ describe("runJobNow (public API for /schedule-prompt retry)", () => {
     expect(pi.exec).toHaveBeenCalledTimes(1);
     expect(aSignal?.aborted).toBe(false);
 
-    // While A hangs, retry B.
+    // While A hangs, retry B. B should be queued, not fired.
     void scheduler.runJobNow(jobB.id);
     await Promise.resolve();
     await Promise.resolve();
-    expect(pi.exec).toHaveBeenCalledTimes(2);
-
-    // CRITICAL: A's signal must NOT have been aborted by starting B.
+    expect(pi.exec).toHaveBeenCalledTimes(1);
+    expect(bSignal).toBeUndefined();
+    // CRITICAL: A's signal must NOT have been aborted by enqueueing B.
     expect(aSignal?.aborted).toBe(false);
-    expect(bSignal?.aborted).toBe(false);
 
-    // Cleanup: resolve both to avoid leaked promises.
+    // Resolve A. The drain should now fire B.
     const okPayload = {
       stdout: JSON.stringify({
         type: "agent_end",
@@ -1611,8 +1728,60 @@ describe("runJobNow (public API for /schedule-prompt retry)", () => {
       killed: false,
     };
     resolveA(okPayload);
+    // Drain executeDedicatedJob's post-await microtasks and the drain dispatch.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(pi.exec).toHaveBeenCalledTimes(2);
+    expect(bSignal?.aborted).toBe(false);
+
     resolveB(okPayload);
     await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it("two cron jobs whose schedules collide do NOT spawn parallel subprocesses (queued serially)", async () => {
+    // Regression for the user's report: two daily routines scheduled for the
+    // same minute both fired "Processing begins" notifications at once,
+    // overwhelming the model API.
+    const jobA = makeJob({ id: "A", dedicatedContext: true });
+    const jobB = makeJob({ id: "B", dedicatedContext: true });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = makeMockPi();
+
+    let resolveA!: (value: any) => void;
+    const aPromise = new Promise<any>((r) => { resolveA = r; });
+    (pi.exec as any).mockImplementationOnce(() => aPromise);
+    (pi.exec as any).mockResolvedValue({
+      stdout: JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }],
+      }),
+      stderr: "",
+      code: 0,
+      killed: false,
+    });
+
+    const scheduler = makeScheduler(storage, pi);
+
+    // Both jobs' cron ticks fire in the same event-loop turn.
+    await (scheduler as any).executeJobIfLeader(jobA);
+    await (scheduler as any).executeJobIfLeader(jobB);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Only A is running; B is in the queue.
+    expect(pi.exec).toHaveBeenCalledTimes(1);
+
+    // A finishes → B drains.
+    resolveA({
+      stdout: JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }],
+      }),
+      stderr: "",
+      code: 0,
+      killed: false,
+    });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(pi.exec).toHaveBeenCalledTimes(2);
   });
 
   it("dedicated retry is independent of the main-session send/agentRunning gate", async () => {
