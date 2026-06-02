@@ -1820,6 +1820,98 @@ describe("runJobNow (public API for /schedule-prompt retry)", () => {
 // pi subprocesses launched in parallel — the user observed 2/3 timing out at the
 // 5-min mark. Fix: route error/sent state through the retry timer.
 
+// ---- recursive-spawn prevention for dedicated cron jobs (Bug 2) ----
+//
+// Commit de11762 ("pick up scheduled recurring jobs that didn't fire") added
+// a missed-job fire-on-start path. For a dedicated cron job, the parent pi
+// fires the job and spawns `pi --mode json -p ...`. That child loads its own
+// pi-schedule-prompt module and runs scheduler.start() — sees the same job
+// in storage with lastRun from the prior tick and lastStatus="running" (set
+// by the parent at scheduler.ts:1188). isMissed() returns true, and:
+//   - Path A (guaranteed, lines 237-246): "running" is not in {error,sent}
+//     so the else branch fires.
+//   - Path B (non-guaranteed recurring, lines 255-264): no status guard at
+//     all — always fires.
+// Either path dispatches enqueueOrRunSubprocess → executeDedicatedJob →
+// pi.exec("pi", ...), spawning a grandchild. Each layer is a live pi process
+// running the same workflow concurrently — the host OOMs.
+
+describe("start(): does not recursively spawn when a dedicated job is already running (lastStatus=running)", () => {
+  function makeCronJob(overrides: Partial<CronJob> = {}): CronJob {
+    return {
+      id: "cron-r",
+      name: "Daily Routine",
+      schedule: "0 30 22 * * *",
+      prompt: "do daily things",
+      enabled: true,
+      type: "cron",
+      runCount: 1,
+      createdAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
+      lastRun: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      guaranteed: true,
+      ...overrides,
+    };
+  }
+
+  it("guaranteed dedicated cron in lastStatus=running with lastRun from a prior tick does NOT re-fire (Path A)", async () => {
+    const job = makeCronJob({
+      dedicatedContext: true,
+      guaranteed: true,
+      lastStatus: "running",
+    });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(pi.exec).not.toHaveBeenCalled();
+  });
+
+  it("non-guaranteed dedicated cron in lastStatus=running with lastRun from a prior tick does NOT re-fire (Path B)", async () => {
+    const job = makeCronJob({
+      dedicatedContext: true,
+      guaranteed: false,
+      lastStatus: "running",
+    });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(pi.exec).not.toHaveBeenCalled();
+  });
+
+  it("guaranteed dedicated interval in lastStatus=running with lastRun older than intervalMs does NOT re-fire", async () => {
+    const job = makeJob({
+      id: "int-r",
+      name: "Hourly Routine",
+      type: "interval",
+      intervalMs: 60 * 60 * 1000,
+      schedule: "60m",
+      dedicatedContext: true,
+      guaranteed: true,
+      lastRun: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      lastStatus: "running",
+      runCount: 1,
+    });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(pi.exec).not.toHaveBeenCalled();
+  });
+});
+
 describe("start(): triages missed jobs by lastStatus (Bug 1: /new re-fire prevention)", () => {
   function makeCronJob(overrides: Partial<CronJob> = {}): CronJob {
     return {

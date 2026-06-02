@@ -229,6 +229,20 @@ export class CronScheduler {
       }
 
       if (this.isMissed(job, now)) {
+        // `lastStatus === "running"` means another scheduler instance — typically
+        // the parent pi that spawned us via `pi --mode json -p` — is currently
+        // executing this job. The in-flight map is module-scope and doesn't
+        // cross the parent/child process boundary, so the durable status is
+        // the only signal we have. Firing here would dispatch a grandchild
+        // subprocess; repeated recursively this OOMs the host.
+        // Trade-off: a host that crashed mid-run leaves the status stuck at
+        // "running" and won't auto-recover on next start — but preventing the
+        // fork-bomb is worth that gap, and the user can clear the status
+        // manually or it'll be reset by a successful run after a manual retry.
+        if (job.lastStatus === "running") {
+          if (job.type !== "once") this.scheduleJob(job);
+          continue;
+        }
         if (job.guaranteed) {
           // If the previous attempt errored or was sent-but-unconfirmed, route through
           // the retry timer rather than firing immediately on session_start. This prevents
