@@ -11,6 +11,21 @@ const DEDICATED_JOB_TIMEOUT_MS = 20 * 60 * 1000;
 const DEDICATED_JOB_TIMEOUT_MIN = DEDICATED_JOB_TIMEOUT_MS / 60_000;
 
 /**
+ * Stale-slot watchdog: how often to sweep the host-wide subprocess slot, and
+ * how old an in-flight entry may get before it's treated as leaked and evicted.
+ *
+ * `executeCommandJob`/`executeDedicatedJob` clear their in-flight entry in a
+ * `finally`, so a normally-settling `pi.exec` always frees the slot. But if the
+ * awaited `exec` never settles (hung child, ineffective `timeout`), the entry
+ * leaks and `isSubprocessSlotBusy()` stays true forever — every later command/
+ * dedicated job then queues and never dispatches. The sweep guarantees the slot
+ * is recoverable. The stale threshold sits just past the exec timeout so a
+ * healthy run's own timeout fires first; the watchdog only catches true leaks.
+ */
+const SUBPROCESS_SWEEP_MS = 60 * 1000;
+const SUBPROCESS_STALE_MS = DEDICATED_JOB_TIMEOUT_MS + 2 * 60 * 1000;
+
+/**
  * Segregated session dir for dedicated subprocesses. Keeps them out of the
  * default `~/.pi/agent/sessions/<cwd>/` selector while still leaving a session
  * file on disk for post-mortem inspection if a dedicated run crashes.
@@ -174,6 +189,12 @@ export class CronScheduler {
    */
   private sendingWatchdog: NodeJS.Timeout | null = null;
   private readonly SENDING_WATCHDOG_MS = 5 * 60 * 1000;
+  /**
+   * Periodic sweep that evicts leaked in-flight subprocess entries so the
+   * host-wide subprocess slot can't get permanently stuck. Started in start(),
+   * cleared in stop(). See SUBPROCESS_STALE_MS.
+   */
+  private subprocessWatchdog: NodeJS.Timeout | null = null;
   /** Tracks which job's prompt is at the tail of the agent context (last sendUserMessage). */
   private contextTailJobId: string | null = null;
   /** Which job triggered the current agent turn (for output capture). */
@@ -286,6 +307,46 @@ export class CronScheduler {
     // (e.g. items enqueued in the old scheduler that hadn't dispatched yet
     // when the session swapped). Safe no-op when the queue is empty.
     this.drainSubprocessQueue();
+
+    this.startSubprocessWatchdog();
+  }
+
+  /**
+   * Arm the periodic stale-slot sweep (idempotent). The interval is `unref`'d
+   * so it never keeps the process alive on its own.
+   */
+  private startSubprocessWatchdog(): void {
+    if (this.subprocessWatchdog !== null) return;
+    const t = setInterval(() => this.sweepStaleSubprocesses(), SUBPROCESS_SWEEP_MS);
+    if (typeof (t as NodeJS.Timeout).unref === "function") (t as NodeJS.Timeout).unref();
+    this.subprocessWatchdog = t;
+  }
+
+  /**
+   * Evict in-flight subprocess entries older than SUBPROCESS_STALE_MS — they
+   * represent an `exec` that never settled and is wedging the host-wide slot.
+   * Abort the (likely-dead) child, drop the entry, then drain so queued jobs
+   * dispatch. Exposed (not private) only so tests can trigger a sweep
+   * deterministically without leaning on real timers.
+   */
+  sweepStaleSubprocesses(): void {
+    const now = Date.now();
+    let evicted = false;
+    for (const map of [inFlightDedicated, inFlightCommand]) {
+      for (const [jobId, entry] of map) {
+        const ageMs = now - new Date(entry.startTime).getTime();
+        if (ageMs > SUBPROCESS_STALE_MS) {
+          console.warn(
+            `Evicting stale in-flight subprocess "${entry.jobName}" (${jobId}): ` +
+              `age ${Math.round(ageMs / 60_000)}m exceeds ${Math.round(SUBPROCESS_STALE_MS / 60_000)}m`
+          );
+          entry.controller.abort();
+          map.delete(jobId);
+          evicted = true;
+        }
+      }
+    }
+    if (evicted) this.drainSubprocessQueue();
   }
 
   /**
@@ -332,6 +393,10 @@ export class CronScheduler {
     if (this.sendingWatchdog !== null) {
       clearTimeout(this.sendingWatchdog);
       this.sendingWatchdog = null;
+    }
+    if (this.subprocessWatchdog !== null) {
+      clearInterval(this.subprocessWatchdog);
+      this.subprocessWatchdog = null;
     }
     this.contextTailJobId = null;
     this.currentTurnJobId = null;
@@ -1230,8 +1295,11 @@ export class CronScheduler {
       status = result.code === 0 && !result.killed && formatted.hasAgentEnd ? "success" : "error";
     } catch (error) {
       if ((error as Error & { name?: string }).name === "AbortError") {
-        // Scheduler was stopped on host quit — exit without updating storage
+        // Aborted (host quit or stale-slot watchdog eviction) — exit without
+        // updating storage, but still free + drain the slot so a queued job
+        // can dispatch instead of stalling behind this aborted run.
         inFlightDedicated.delete(job.id);
+        this.drainSubprocessQueue();
         return;
       }
       const durationS = Math.round((Date.now() - startMs) / 1000);
@@ -1392,8 +1460,11 @@ export class CronScheduler {
       status = exitCode === 0 && !killed ? "success" : "error";
     } catch (error) {
       if ((error as Error & { name?: string }).name === "AbortError") {
-        // Scheduler stopped on host quit — exit without updating storage.
+        // Aborted (host quit or stale-slot watchdog eviction) — exit without
+        // updating storage, but still free + drain the slot so a queued job
+        // can dispatch instead of stalling behind this aborted run.
         inFlightCommand.delete(job.id);
+        this.drainSubprocessQueue();
         return;
       }
       const durationS = Math.round((Date.now() - startMs) / 1000);

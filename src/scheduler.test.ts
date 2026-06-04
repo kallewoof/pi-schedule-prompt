@@ -2740,3 +2740,89 @@ describe("stop({ reason }) preserves dedicated subprocesses across session repla
     await vi.advanceTimersByTimeAsync(0);
   });
 });
+
+describe("subprocess slot recovery (stuck-slot regression)", () => {
+  // Regression for the production incident where command-mode scheduled prompts
+  // silently stopped firing: a leaked in-flight subprocess entry left the
+  // host-wide slot busy forever, so every later command/dedicated job queued and
+  // never dispatched (pi emitted nothing at fire time). Two guards fix it — the
+  // AbortError path now drains, and a stale-slot watchdog evicts leaked entries.
+  function makeCommandJob(overrides: Partial<CronJob> = {}): CronJob {
+    return makeJob({ command: true, prompt: "echo hi", ...overrides });
+  }
+
+  it("drains the queued command job after the in-flight one is aborted (drain not skipped on AbortError)", async () => {
+    const jobA = makeCommandJob({ id: "A", prompt: "echo A" });
+    const jobB = makeCommandJob({ id: "B", prompt: "echo B" });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = makeMockPi();
+
+    let rejectA!: (err: unknown) => void;
+    const aPromise = new Promise<any>((_resolve, reject) => { rejectA = reject; });
+    (pi.exec as any).mockImplementationOnce(() => aPromise); // A hangs in the slot
+    (pi.exec as any).mockResolvedValue({ stdout: "B-out", stderr: "", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi);
+
+    // A occupies the single subprocess slot.
+    void scheduler.runJobNow(jobA.id);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(pi.exec).toHaveBeenCalledTimes(1);
+
+    // B enqueues behind the busy slot — must not run in parallel.
+    void scheduler.runJobNow(jobB.id);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(pi.exec).toHaveBeenCalledTimes(1);
+
+    // Abort A (as host-quit or the stale-slot watchdog does). The catch must
+    // free AND drain the slot — the bug was the early return skipping the drain.
+    const abortErr = new Error("aborted");
+    (abortErr as Error & { name: string }).name = "AbortError";
+    rejectA(abortErr);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    expect(pi.exec).toHaveBeenCalledTimes(2);
+    expect((pi.exec as any).mock.calls[1]).toEqual(["bash", ["-c", "echo B"], expect.anything()]);
+
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it("evicts a leaked in-flight subprocess after the stale timeout and drains the queue", async () => {
+    const jobA = makeCommandJob({ id: "A", prompt: "echo A" });
+    const jobB = makeCommandJob({ id: "B", prompt: "echo B" });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = makeMockPi();
+
+    // A's exec never settles — simulates a child whose own timeout never fired,
+    // so the finally that frees the slot never runs and the entry leaks.
+    const aPromise = new Promise<any>(() => {});
+    (pi.exec as any).mockImplementationOnce(() => aPromise);
+    (pi.exec as any).mockResolvedValue({ stdout: "B-out", stderr: "", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi);
+
+    void scheduler.runJobNow(jobA.id);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    void scheduler.runJobNow(jobB.id);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(pi.exec).toHaveBeenCalledTimes(1); // A in-flight, B queued
+
+    // Before the stale threshold the sweep is a no-op — A is still "fresh".
+    scheduler.sweepStaleSubprocesses();
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(pi.exec).toHaveBeenCalledTimes(1);
+
+    // Past the threshold (exec timeout + grace), the sweep evicts A and the slot
+    // is recoverable: B finally dispatches.
+    await vi.advanceTimersByTimeAsync(20 * 60 * 1000 + 3 * 60 * 1000);
+    scheduler.sweepStaleSubprocesses();
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    expect(pi.exec).toHaveBeenCalledTimes(2);
+    expect((pi.exec as any).mock.calls[1]).toEqual(["bash", ["-c", "echo B"], expect.anything()]);
+
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+});
