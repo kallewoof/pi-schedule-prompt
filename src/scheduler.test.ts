@@ -1581,23 +1581,26 @@ describe("runJobNow (public API for /schedule-prompt retry)", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("dedicated-job notifications keep the prompt out of the message body, and only use deliverAs:nextTurn while an agent is streaming", async () => {
-    // Two regressions in one test:
+  it("dedicated-job notifications keep the prompt out of the message body and never use deliverAs:nextTurn", async () => {
+    // Two invariants in one test:
     //
-    // 1) Agent-leak: pi.sendMessage during a streaming turn defaults to
-    //    agent.steer(), which feeds the message into the next assistant prompt.
-    //    If the message body contains the dedicated prompt text, the main agent
-    //    picks it up and starts executing the dedicated job's task itself.
-    //    Scrub the prompt text from content[0].text unconditionally, and pass
-    //    deliverAs:"nextTurn" while the agent is streaming.
+    // 1) Agent-leak protection (structural): pi.sendMessage during a streaming
+    //    turn defaults to agent.steer(), which feeds the message into the next
+    //    assistant prompt. If the message body contained the dedicated prompt
+    //    text, the host agent would pick it up and start executing the
+    //    dedicated job's task itself. Scrub the prompt from content[0].text
+    //    unconditionally — the renderer reads it from details.prompt.
     //
-    // 2) Idle-session swallow: pi-mono's "nextTurn" delivery pushes the message
-    //    into _pendingNextTurnMessages and only renders it when the user sends
-    //    another prompt. If we used "nextTurn" unconditionally, an end
-    //    notification fired during an idle session would silently sit in the
-    //    queue and the user would never see "[Scheduled Prompt] Processing
-    //    ended". When idle, omit deliverAs so the message renders immediately
-    //    via message_start/message_end.
+    // 2) No silent parking: pi-mono's "nextTurn" delivery pushes the message
+    //    into _pendingNextTurnMessages and only emits message_start/_end when
+    //    the user sends another prompt. An idle session never drains the
+    //    queue, so a notification fired during such a session sits invisibly
+    //    forever. We previously gated this on agentRunning ("nextTurn while
+    //    streaming, immediate otherwise"), but agentRunning can stick true
+    //    (overflow recovery suppresses agent_end; stale scheduler bindings
+    //    miss their session's events). The fix: never use nextTurn. With the
+    //    structural prompt-scrub above, immediate emit is safe even during a
+    //    live turn (worst case: a short status notification gets steered in).
     const job = makeJob({
       id: "ded",
       dedicatedContext: true,
@@ -1649,8 +1652,10 @@ describe("runJobNow (public API for /schedule-prompt retry)", () => {
     expect(beginSeen).toBe(true);
     expect(endSeen).toBe(true);
 
-    // Streaming path: simulate an active user turn and verify deliverAs flips
-    // to "nextTurn" so the notification doesn't steer the live agent.
+    // Streaming path: even with an active agent turn, notifications must NOT
+    // use "nextTurn" — they'd never drain on an idle session. The structural
+    // prompt-scrub above keeps a steered notification from feeding the agent
+    // the dedicated workflow.
     pi.sendMessage.mockClear();
     pi.exec.mockResolvedValueOnce({
       stdout: JSON.stringify({
@@ -1666,8 +1671,12 @@ describe("runJobNow (public API for /schedule-prompt retry)", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(pi.sendMessage).toHaveBeenCalled();
     for (const call of pi.sendMessage.mock.calls) {
-      const [, opts] = call as [any, any];
-      expect(opts).toMatchObject({ deliverAs: "nextTurn" });
+      const [msg, opts] = call as [any, any];
+      // Prompt-scrub invariant must still hold under streaming.
+      const bodyText = Array.isArray(msg.content) ? msg.content[0]?.text ?? "" : String(msg.content ?? "");
+      expect(bodyText).not.toContain("PROMPT_TEXT_THAT_MUST_NOT_LEAK");
+      // No silent parking under any condition.
+      expect(opts?.deliverAs).not.toBe("nextTurn");
     }
   });
 
@@ -2824,5 +2833,146 @@ describe("subprocess slot recovery (stuck-slot regression)", () => {
 
     for (let i = 0; i < 10; i++) await Promise.resolve();
     await vi.advanceTimersByTimeAsync(0);
+  });
+});
+
+describe("notify emits unconditionally (silent-park regression)", () => {
+  // Regression for the production incident where command-mode scheduled prompts
+  // ran successfully (storage updated, run record captured) but never reached
+  // the Signal bridge. Root cause: the notify helper used `deliverAs:"nextTurn"`
+  // whenever `this.agentRunning` was true. pi-mono's sendCustomMessage parks
+  // nextTurn messages in `_pendingNextTurnMessages` without emitting
+  // message_start/message_end — they only fire when the next user prompt
+  // drains the queue. `agentRunning` can stick true (overflow recovery
+  // suppresses agent_end; stale scheduler bindings miss their session's
+  // events), so once stuck every command_end was silently swallowed.
+  //
+  // The fix: always pass opts without `deliverAs` so sendCustomMessage hits
+  // the non-streaming else branch (immediate _emit) or steers during an
+  // active turn — never the silent-park branch.
+
+  function makeCommandJob(overrides: Partial<CronJob> = {}): CronJob {
+    return makeJob({ command: true, prompt: "echo hi", ...overrides });
+  }
+
+  it("command_end emits without deliverAs even when agentRunning is true", async () => {
+    const job = makeCommandJob({ id: "cmd-A", targetContext: "+alice" });
+    const storage = makeMockStorage([job]);
+    const pi = {
+      ...makeMockPi(),
+      sendMessageToContext: vi.fn(),
+      sendUserMessageToContext: vi.fn(),
+    };
+    (pi.exec as any).mockResolvedValue({ stdout: "hello\n", stderr: "", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi as any);
+    // Force the sticky-true state that triggered the prod bug.
+    (scheduler as any).agentRunning = true;
+
+    await executeJob(scheduler, job);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    // The command_end notify must reach pi-mono. Find the call carrying it.
+    const commandEndCall = pi.sendMessageToContext.mock.calls.find(
+      ([, msg]) => msg?.customType === "scheduled_prompt_command_end"
+    );
+    expect(commandEndCall).toBeDefined();
+    expect(commandEndCall![0]).toBe("+alice");
+    // If a third positional argument is passed, it must not steer pi-mono into
+    // the silent-park branch.
+    const opts = commandEndCall![2];
+    expect(opts?.deliverAs).not.toBe("nextTurn");
+  });
+
+  it("command_end emits via sendMessage when no targetContext, also without nextTurn", async () => {
+    const job = makeCommandJob({ id: "cmd-B", targetContext: undefined });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    (pi.exec as any).mockResolvedValue({ stdout: "hello\n", stderr: "", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi);
+    (scheduler as any).agentRunning = true;
+
+    await executeJob(scheduler, job);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    const commandEndCall = pi.sendMessage.mock.calls.find(
+      ([msg]: any[]) => msg?.customType === "scheduled_prompt_command_end"
+    );
+    expect(commandEndCall).toBeDefined();
+    const opts = commandEndCall![1];
+    expect(opts?.deliverAs).not.toBe("nextTurn");
+  });
+
+  it("dedicated begin/end emit without deliverAs even when agentRunning is true", async () => {
+    const job = makeJob({
+      id: "ded-A",
+      dedicatedContext: true,
+      targetContext: "+alice",
+      prompt: "do the work",
+    });
+    const storage = makeMockStorage([job]);
+    const pi = {
+      ...makeMockPi(),
+      sendMessageToContext: vi.fn(),
+      sendUserMessageToContext: vi.fn(),
+    };
+    // Dedicated jobs spawn `pi --mode json -p` and parse its JSONL output. A
+    // minimal agent_end event is enough to satisfy `formatDedicatedRunOutput`.
+    const agentEnd = JSON.stringify({
+      type: "agent_end",
+      messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
+    });
+    (pi.exec as any).mockResolvedValue({ stdout: agentEnd + "\n", stderr: "", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi as any);
+    (scheduler as any).agentRunning = true;
+
+    await executeJob(scheduler, job);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    const calls = pi.sendMessageToContext.mock.calls.filter(
+      ([, msg]: any[]) =>
+        msg?.customType === "scheduled_prompt_begin" ||
+        msg?.customType === "scheduled_prompt_end"
+    );
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    for (const call of calls) {
+      const opts = call[2];
+      expect(opts?.deliverAs).not.toBe("nextTurn");
+    }
+  });
+
+  it("dedicated job's prompt text is NOT in content[0].text (steer-safety invariant)", async () => {
+    // The structural mitigation that makes opts={} safe for dedicated jobs:
+    // the prompt is exposed via details.prompt, never via content[0].text.
+    // If this invariant ever regresses, a steered notification could feed the
+    // host agent the dedicated workflow and trigger recursive execution.
+    const job = makeJob({
+      id: "ded-B",
+      dedicatedContext: true,
+      targetContext: "+alice",
+      prompt: "PROMPT_THAT_MUST_NOT_LEAK",
+    });
+    const storage = makeMockStorage([job]);
+    const pi = {
+      ...makeMockPi(),
+      sendMessageToContext: vi.fn(),
+      sendUserMessageToContext: vi.fn(),
+    };
+    const agentEnd = JSON.stringify({
+      type: "agent_end",
+      messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
+    });
+    (pi.exec as any).mockResolvedValue({ stdout: agentEnd + "\n", stderr: "", code: 0, killed: false });
+
+    const scheduler = makeScheduler(storage, pi as any);
+    await executeJob(scheduler, job);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    for (const [, msg] of pi.sendMessageToContext.mock.calls as any[]) {
+      const text = msg?.content?.[0]?.text ?? "";
+      expect(text).not.toContain("PROMPT_THAT_MUST_NOT_LEAK");
+    }
   });
 });

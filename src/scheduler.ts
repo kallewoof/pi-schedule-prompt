@@ -1212,20 +1212,25 @@ export class CronScheduler {
       job.targetContext &&
       typeof piAny.sendMessageToContext === "function";
 
-    // CRITICAL: dedicated-job begin/end notifications must NEVER feed the running
-    // agent. pi-mono's sendCustomMessage defaults to `agent.steer(message)` when
-    // the agent is streaming, which queues the message as a prompt for the next
-    // assistant turn. If the message body contains the dedicated prompt text,
-    // the main agent will pick it up and start executing the dedicated job's
-    // task itself — defeating the entire point of dedicated context. We:
-    //   1) keep the prompt out of `content[0].text` (renderer uses details.prompt)
-    //   2) pass `deliverAs: "nextTurn"` ONLY when the agent is actively streaming,
-    //      so the notification doesn't steer the active turn. When the session is
-    //      idle, omit deliverAs so pi-mono renders the message immediately via
-    //      message_start/message_end — otherwise nextTurn-queued notifications sit
-    //      invisibly in _pendingNextTurnMessages until the user submits another
-    //      prompt, which is why an end notification appeared to never arrive when
-    //      a dedicated job finished during an idle session.
+    // Dedicated-job begin/end notifications must NEVER feed the running agent
+    // the dedicated job's prompt — otherwise the host agent picks it up and
+    // re-runs the same workflow, defeating the entire point of dedicated context.
+    // That risk is structurally mitigated: the prompt is kept out of
+    // `content[0].text` and exposed only via `details.prompt` (the renderer
+    // reads from details). With that invariant in place, sending opts={} is
+    // safe even when the agent is streaming — at worst `agent.steer()` injects
+    // a short status notification into the active turn.
+    //
+    // We previously gated this on `this.agentRunning` and used `deliverAs:
+    // "nextTurn"` while a turn was in flight. That was an over-rotation: the
+    // `nextTurn` branch in pi-mono's sendCustomMessage pushes into
+    // `_pendingNextTurnMessages` and emits nothing until the next user prompt
+    // drains the queue. `this.agentRunning` can be sticky-true (overflow
+    // recovery suppresses `agent_end`; a stale scheduler binding never sees
+    // its session's agent_start/end). When stuck, every notification was
+    // silently parked — so e.g. command-mode reminders never reached the
+    // Signal bridge despite the bash command running successfully. Silent
+    // parking is strictly worse than incidental steering for status messages.
     const notify = (customType: string, text: string, details: Record<string, unknown>) => {
       // If the scheduler was stopped (e.g. by session_shutdown during /new) while
       // a dedicated subprocess was past `await pi.exec(...)`, the captured `pi`
@@ -1239,12 +1244,15 @@ export class CronScheduler {
         display: true,
         details,
       };
-      const opts = this.agentRunning ? { deliverAs: "nextTurn" as const } : {};
+      const target = notifyToContext ? job.targetContext : "<bound-session>";
+      console.log(
+        `[scheduler] notify emit customType=${customType} jobId=${job.id} target=${target}`
+      );
       try {
         if (notifyToContext) {
-          piAny.sendMessageToContext(job.targetContext, msg, opts);
+          piAny.sendMessageToContext(job.targetContext, msg);
         } else {
-          this.pi.sendMessage(msg, opts);
+          this.pi.sendMessage(msg);
         }
       } catch (err) {
         // Defense in depth: if the ctx went stale between the `stopped` check
@@ -1252,9 +1260,16 @@ export class CronScheduler {
         // first), don't propagate — it would surface as an uncaught exception
         // from the cron tick.
         const message = err instanceof Error ? err.message : String(err);
-        if (!/stale after session replacement|extension ctx is stale/i.test(message)) {
-          throw err;
+        if (/stale after session replacement|extension ctx is stale/i.test(message)) {
+          console.warn(
+            `[scheduler] notify dropped (stale ctx) customType=${customType} jobId=${job.id}`
+          );
+          return;
         }
+        console.warn(
+          `[scheduler] notify threw customType=${customType} jobId=${job.id}: ${message}`
+        );
+        throw err;
       }
     };
 
@@ -1404,10 +1419,21 @@ export class CronScheduler {
       job.targetContext &&
       typeof piAny.sendMessageToContext === "function";
 
-    // Same notification discipline as executeDedicatedJob — see the lengthy
-    // rationale on its `notify` helper. Reproduced here so command-mode
-    // notifications can't accidentally steer an active agent turn or throw
-    // on a stale ctx after session_shutdown.
+    // command_end carries the captured stdout/stderr of the bash run and is
+    // the ONLY way the user (or the Signal bridge) ever learns the command
+    // produced output. Emit immediately with no opts.
+    //
+    // We must NOT pass `deliverAs: "nextTurn"`, even when an agent turn is in
+    // flight: that branch in pi-mono's sendCustomMessage pushes into
+    // `_pendingNextTurnMessages` and emits nothing until the next user prompt
+    // drains the queue. Command-mode jobs run independently of any agent
+    // turn — if no one prompts the agent before the next command fires, the
+    // queued notification sits invisibly forever and the user never sees
+    // their reminder. Confirmed in prod: `agentRunning` can be sticky-true
+    // (overflow recovery suppresses `agent_end`; a stale scheduler binding
+    // never receives its session's agent_start/end), and once stuck every
+    // subsequent command_end was silently parked. Silent parking is strictly
+    // worse than incidental steering for status-only messages.
     const notify = (customType: string, text: string, details: Record<string, unknown>) => {
       if (this.stopped) return;
       const msg = {
@@ -1416,18 +1442,28 @@ export class CronScheduler {
         display: true,
         details,
       };
-      const opts = this.agentRunning ? { deliverAs: "nextTurn" as const } : {};
+      const target = notifyToContext ? job.targetContext : "<bound-session>";
+      console.log(
+        `[scheduler] notify emit customType=${customType} jobId=${job.id} target=${target}`
+      );
       try {
         if (notifyToContext) {
-          piAny.sendMessageToContext(job.targetContext, msg, opts);
+          piAny.sendMessageToContext(job.targetContext, msg);
         } else {
-          this.pi.sendMessage(msg, opts);
+          this.pi.sendMessage(msg);
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (!/stale after session replacement|extension ctx is stale/i.test(message)) {
-          throw err;
+        if (/stale after session replacement|extension ctx is stale/i.test(message)) {
+          console.warn(
+            `[scheduler] notify dropped (stale ctx) customType=${customType} jobId=${job.id}`
+          );
+          return;
         }
+        console.warn(
+          `[scheduler] notify threw customType=${customType} jobId=${job.id}: ${message}`
+        );
+        throw err;
       }
     };
 
