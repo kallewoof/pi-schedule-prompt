@@ -240,7 +240,7 @@ export class CronScheduler {
       // swap and is still running in a prior scheduler instance's promise.
       // The natural cron tick (or its own pendingDedicatedRetriesGlobal hook)
       // will handle re-firing once that subprocess finishes.
-      if (job.dedicatedContext && inFlightDedicated.has(job.id)) {
+      if ((job.dedicatedContext || job.standalone) && inFlightDedicated.has(job.id)) {
         if (job.type !== "once") this.scheduleJob(job);
         continue;
       }
@@ -851,7 +851,7 @@ export class CronScheduler {
   async runJobNow(jobId: string): Promise<"fired" | "queued"> {
     const job = this.storage.getJob(jobId);
     if (!job) throw new Error(`Job ${jobId} not found`);
-    if (job.dedicatedContext && inFlightDedicated.has(jobId)) {
+    if ((job.dedicatedContext || job.standalone) && inFlightDedicated.has(jobId)) {
       // The current subprocess (which may have been started by a prior scheduler
       // instance, before /new) will see this flag in its completion path and
       // re-fire itself once it finishes. Avoids silently no-op'ing the user's
@@ -865,7 +865,7 @@ export class CronScheduler {
       pendingCommandRetriesGlobal.add(jobId);
       return "queued";
     }
-    if (job.dedicatedContext) {
+    if (job.dedicatedContext || job.standalone) {
       return this.enqueueOrRunSubprocess("dedicated", job) === "fired" ? "fired" : "queued";
     }
     if (job.command) {
@@ -946,10 +946,12 @@ export class CronScheduler {
       this.enqueueOrRunSubprocess("command", job);
       return;
     }
-    if (job.dedicatedContext) {
+    if (job.dedicatedContext || job.standalone) {
       // Runs in an isolated subprocess — does not block the main agent, but
       // is host-serialized against other dedicated/command runs to keep API
-      // load and shared-file contention under control.
+      // load and shared-file contention under control. `standalone` jobs use
+      // the same path; they additionally capture the session file for replay/
+      // enter and surface a persistent report indicator on completion.
       this.enqueueOrRunSubprocess("dedicated", job);
       return;
     }
@@ -1288,6 +1290,7 @@ export class CronScheduler {
 
     let status: "success" | "error" = "success";
     let output = "";
+    let sessionFilePath: string | undefined;
     const startMs = Date.now();
 
     try {
@@ -1304,6 +1307,9 @@ export class CronScheduler {
       const durationS = Math.round((Date.now() - startMs) / 1000);
       const formatted = formatDedicatedRunOutput(result.stdout, result.stderr, result.code, result.killed, durationS);
       output = formatted.output;
+      // Capture the subprocess session file so a `standalone` run can be entered
+      // for follow-ups later. Cheap and harmless for plain dedicated runs too.
+      sessionFilePath = resolveDedicatedSessionFile(formatted.sessionId) ?? undefined;
       // A successful pi --mode json run always emits an agent_end event with at least one
       // assistant message containing text. If we didn't see that, treat as failure even
       // when the exit code is 0 (timeout-killed processes resolve with code 0 sometimes).
@@ -1325,7 +1331,10 @@ export class CronScheduler {
       inFlightDedicated.delete(job.id);
     }
 
-    this.captureRunRecordFromOutput(job, output, status, startTime);
+    this.captureRunRecordFromOutput(job, output, status, startTime, {
+      standalone: job.standalone ?? false,
+      sessionFilePath,
+    });
 
     if (job.type === "once") {
       if (status === "success" || !job.guaranteed) {
@@ -1582,7 +1591,8 @@ export class CronScheduler {
     job: CronJob,
     output: string,
     status: "success" | "error",
-    startTime: string | null
+    startTime: string | null,
+    extra?: { standalone?: boolean; sessionFilePath?: string }
   ): void {
     const endTime = new Date().toISOString();
     this.storage.addRunRecord({
@@ -1595,6 +1605,8 @@ export class CronScheduler {
       endTime,
       output,
       status,
+      standalone: extra?.standalone ?? false,
+      sessionFilePath: extra?.sessionFilePath,
     });
   }
 
@@ -1605,7 +1617,7 @@ export class CronScheduler {
     startTime: string | null
   ): void {
     const endTime = new Date().toISOString();
-    const record: RunRecord = {
+    const record: Omit<RunRecord, "id"> = {
       jobId: job.id,
       jobName: job.name,
       jobPrompt: job.prompt,
@@ -1781,10 +1793,14 @@ export function formatDedicatedRunOutput(
   code: number,
   killed: boolean,
   durationS: number
-): { output: string; hasAgentEnd: boolean } {
+): { output: string; hasAgentEnd: boolean; sessionId: string | null } {
   const header = `[exit=${code} killed=${killed} duration=${durationS}s]`;
   const events: Array<Record<string, unknown>> = [];
   let hasAgentEnd = false;
+  // The first JSON line in `pi --mode json` is the session header
+  // ({ type: "session", id, ... }). Capture its id so the caller can locate
+  // the on-disk session file (`<session-dir>/*_${id}.jsonl`) for enter/replay.
+  let sessionId: string | null = null;
 
   for (const line of stdout.split("\n")) {
     const trimmed = line.trim();
@@ -1793,6 +1809,9 @@ export function formatDedicatedRunOutput(
       const event = JSON.parse(trimmed) as Record<string, unknown>;
       events.push(event);
       if (event["type"] === "agent_end") hasAgentEnd = true;
+      if (sessionId === null && event["type"] === "session" && typeof event["id"] === "string") {
+        sessionId = event["id"] as string;
+      }
     } catch {
       // Non-JSON line — likely a startup banner or error; ignored for rendering.
     }
@@ -1873,7 +1892,25 @@ export function formatDedicatedRunOutput(
     const head = output.slice(0, MAX_OUTPUT_BYTES);
     output = `${head}\n\n[output truncated; full size = ${output.length} bytes]`;
   }
-  return { output, hasAgentEnd };
+  return { output, hasAgentEnd, sessionId };
+}
+
+/**
+ * Locate the on-disk session JSONL written by a dedicated subprocess, given the
+ * session id parsed from its JSON output. Session files are named
+ * `${fileTimestamp}_${id}.jsonl`, so we scan the dedicated session dir for the
+ * single entry ending `_${id}.jsonl`. Returns the absolute path, or null if the
+ * id is missing or no matching file exists. Best-effort: any fs error → null.
+ */
+function resolveDedicatedSessionFile(sessionId: string | null): string | null {
+  if (!sessionId) return null;
+  try {
+    const suffix = `_${sessionId}.jsonl`;
+    const match = fs.readdirSync(DEDICATED_SESSION_DIR).find((name) => name.endsWith(suffix));
+    return match ? path.join(DEDICATED_SESSION_DIR, match) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

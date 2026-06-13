@@ -2051,6 +2051,31 @@ describe("recurring guaranteed dedicated jobs schedule a retry on failure", () =
   });
 });
 
+// ---- formatDedicatedRunOutput: session id capture (standalone/enter) ----
+
+describe("formatDedicatedRunOutput: captures the session id from the header", () => {
+  it("extracts id from the first {type:'session'} event", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", version: 3, id: "sess-abc123", timestamp: "2026-06-11T10:00:00.000Z", cwd: "/work" }),
+      JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }] }),
+    ].join("\n");
+    const { sessionId } = formatDedicatedRunOutput(jsonl, "", 0, false, 1);
+    expect(sessionId).toBe("sess-abc123");
+  });
+
+  it("returns null when no session header is present", () => {
+    const jsonl = JSON.stringify({ type: "agent_end", messages: [] });
+    const { sessionId } = formatDedicatedRunOutput(jsonl, "", 0, false, 1);
+    expect(sessionId).toBeNull();
+  });
+
+  it("ignores a session event missing a string id", () => {
+    const jsonl = JSON.stringify({ type: "session", timestamp: "t", cwd: "/work" });
+    const { sessionId } = formatDedicatedRunOutput(jsonl, "", 0, false, 1);
+    expect(sessionId).toBeNull();
+  });
+});
+
 // ---- formatDedicatedRunOutput: Bug 2 (always-have-something-to-show) ----
 
 describe("formatDedicatedRunOutput: always emits diagnostic info (Bug 2)", () => {

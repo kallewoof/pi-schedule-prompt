@@ -1,6 +1,41 @@
 import * as fs from "fs";
 import * as path from "path";
+import { nanoid } from "nanoid";
 import type { CronJob, CronStore, RunRecord } from "./types.js";
+
+/** Max run records retained for /schedule-prompt replay. */
+const MAX_RUN_HISTORY = 10;
+
+/**
+ * Trim run history to MAX_RUN_HISTORY, oldest-first, while preferentially
+ * preserving unacknowledged standalone reports so a pending report can't be
+ * silently evicted before the user sees it. Only if the history is *entirely*
+ * unread reports beyond the cap do we drop the oldest of those too — the cap
+ * stays a hard upper bound on store growth. Order (newest last) is preserved.
+ */
+export function trimRunHistory(history: RunRecord[]): RunRecord[] {
+  let excess = history.length - MAX_RUN_HISTORY;
+  if (excess <= 0) return history;
+  const isProtected = (r: RunRecord) => !!(r.standalone && !r.acknowledged);
+  const toRemove = new Set<RunRecord>();
+  // Pass 1: drop oldest non-protected records first.
+  for (const r of history) {
+    if (excess <= 0) break;
+    if (!isProtected(r)) {
+      toRemove.add(r);
+      excess--;
+    }
+  }
+  // Pass 2: still over budget (history is all unread reports) — drop oldest.
+  for (const r of history) {
+    if (excess <= 0) break;
+    if (!toRemove.has(r)) {
+      toRemove.add(r);
+      excess--;
+    }
+  }
+  return history.filter((r) => !toRemove.has(r));
+}
 
 /**
  * Handles persistence of scheduled prompts to .pi/schedule-prompts.json
@@ -157,11 +192,36 @@ export class CronStorage {
     return this.load().runHistory ?? [];
   }
 
-  addRunRecord(record: RunRecord): void {
+  addRunRecord(record: Omit<RunRecord, "id">): void {
     const store = this.load();
     const history = store.runHistory ?? [];
-    history.push(record);
-    if (history.length > 10) history.splice(0, history.length - 10);
+    history.push({ id: nanoid(10), ...record });
+    this.save({ ...store, runHistory: trimRunHistory(history) });
+  }
+
+  /** Standalone reports the user hasn't yet viewed or dismissed (newest last). */
+  getUnacknowledgedReports(): RunRecord[] {
+    return this.getRunHistory().filter((r) => r.standalone && !r.acknowledged);
+  }
+
+  /** Mark a single run record acknowledged by its id. Returns false if not found. */
+  acknowledgeRun(id: string): boolean {
+    const store = this.load();
+    const history = store.runHistory ?? [];
+    const record = history.find((r) => r.id === id);
+    if (!record) return false;
+    record.acknowledged = true;
+    this.save({ ...store, runHistory: history });
+    return true;
+  }
+
+  /** Mark every standalone report acknowledged. */
+  acknowledgeAllReports(): void {
+    const store = this.load();
+    const history = store.runHistory ?? [];
+    for (const r of history) {
+      if (r.standalone) r.acknowledged = true;
+    }
     this.save({ ...store, runHistory: history });
   }
 

@@ -126,9 +126,12 @@ export class CronWidget {
       return;
     }
 
-    // Auto-hide if no jobs configured
+    // Auto-hide only when there's nothing to show — no jobs AND no pending
+    // standalone reports. Reports keep the widget visible so its banner can
+    // surface them even after a one-shot job was removed on completion.
     const jobs = this.storage.getAllJobs();
-    if (jobs.length === 0) {
+    const pendingReports = this.storage.getUnacknowledgedReports().length;
+    if (jobs.length === 0 && pendingReports === 0) {
       this.hide(ctx);
       return;
     }
@@ -209,6 +212,21 @@ export class CronWidget {
       )
     );
     container.addChild(new Spacer(1));
+
+    // Persistent "reports available" banner — shown until the user views or
+    // dismisses the standalone reports (see /schedule-prompt reports).
+    const pendingReports = this.storage.getUnacknowledgedReports().length;
+    if (pendingReports > 0) {
+      container.addChild(
+        new Text(
+          theme.fg("warning", `📋 ${pendingReports} report${pendingReports > 1 ? "s" : ""} available`) +
+            theme.fg("dim", " — /schedule-prompt reports"),
+          1,
+          0
+        )
+      );
+      container.addChild(new Spacer(1));
+    }
 
     // Job rows
     const lines: string[] = [];

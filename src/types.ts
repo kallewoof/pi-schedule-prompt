@@ -48,7 +48,9 @@ export interface CronJob {
   targetContext?: string;
   /** If true, run prompt in a fresh blank subprocess context; main session receives only start/end notifications */
   dedicatedContext?: boolean;
-  /** If true, the prompt is executed as a shell command via `bash -c` instead of being sent to the agent. Mutually exclusive with dedicatedContext. */
+  /** If true, run prompt in a dedicated subprocess like `dedicatedContext`, but keep the resulting session viewable/enterable (`/schedule-prompt enter`) and raise a persistent "reports available" indicator until viewed or dismissed. Mutually exclusive with command. */
+  standalone?: boolean;
+  /** If true, the prompt is executed as a shell command via `bash -c` instead of being sent to the agent. Mutually exclusive with dedicatedContext and standalone. */
   command?: boolean;
 }
 
@@ -56,6 +58,8 @@ export interface CronJob {
  * Record of a single scheduled job run, persisted for /schedule-prompt replay
  */
 export interface RunRecord {
+  /** Stable per-run id, so a report can be addressed (enter/dismiss) and acknowledged. */
+  id: string;
   jobId: string;
   jobName: string;
   jobPrompt: string;
@@ -68,6 +72,12 @@ export interface RunRecord {
   /** Extracted assistant text from the turn */
   output: string;
   status: "success" | "error";
+  /** True when this run came from a `standalone` job and should surface as a report. */
+  standalone?: boolean;
+  /** Resolved path of the dedicated subprocess session file, for `/schedule-prompt enter`. */
+  sessionFilePath?: string;
+  /** True once the user has viewed (replay/enter) or dismissed the report. */
+  acknowledged?: boolean;
 }
 
 /**
@@ -140,6 +150,12 @@ export const CronToolParams = Type.Object({
     Type.Boolean({
       description:
         "If true, run the prompt in a blank dedicated subprocess context. The current session receives only start/end notifications; full output is viewable via /schedule-prompt replay.",
+    })
+  ),
+  standalone: Type.Optional(
+    Type.Boolean({
+      description:
+        "Like dedicatedContext (runs in a blank dedicated subprocess), but in addition the resulting session is viewable and enterable for follow-up questions via /schedule-prompt enter, and a persistent 'reports available' indicator is shown until the user views or dismisses it. Use for tasks that produce a report you'll want to read or dig into later. Mutually exclusive with command.",
     })
   ),
   command: Type.Optional(

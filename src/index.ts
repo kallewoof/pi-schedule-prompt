@@ -9,6 +9,7 @@
  * - Persistence via .pi/schedule-prompts.json
  */
 
+import * as fs from "fs";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { CronJob, RunRecord, SessionShutdownReason } from "./types.js";
 import { Key } from "@mariozechner/pi-tui";
@@ -151,7 +152,8 @@ export function formatReplayRecord(record: RunRecord): string {
 async function handleReplay(
   arg: string,
   ctx: any,
-  storage: CronStorage
+  storage: CronStorage,
+  refresh: (ctx: any) => void
 ): Promise<void> {
   const history = storage.getRunHistory();
   if (history.length === 0) {
@@ -164,6 +166,103 @@ async function handleReplay(
     return;
   }
   ctx.ui.notify(formatReplayRecord(record), "info");
+  // Viewing a standalone report's output clears it from the pending indicator.
+  if (record.standalone && !record.acknowledged) {
+    storage.acknowledgeRun(record.id);
+    refresh(ctx);
+  }
+}
+
+/** Format the list of standalone reports awaiting review for `/schedule-prompt reports`. */
+export function formatReportsList(reports: ReadonlyArray<RunRecord>): string {
+  const lines = [`Reports available (${reports.length}):`, ""];
+  for (const r of reports) {
+    const when = formatLocalDateTime(new Date(r.endTime));
+    const statusMark = r.status === "success" ? "✓" : "⚠";
+    lines.push(`${statusMark} ${r.jobName} (${r.jobId})  •  ${when}`);
+    const enterable = r.sessionFilePath ? "enter to open · " : "";
+    lines.push(`    ${enterable}replay to read · dismiss to clear`);
+  }
+  lines.push("");
+  lines.push("Use: /schedule-prompt enter|replay|dismiss [N|jobId|substring]");
+  return lines.join("\n");
+}
+
+async function handleReports(ctx: any, storage: CronStorage): Promise<void> {
+  const reports = storage.getUnacknowledgedReports();
+  if (reports.length === 0) {
+    ctx.ui.notify("No reports awaiting review.", "info");
+    return;
+  }
+  ctx.ui.notify(formatReportsList(reports), "info");
+}
+
+async function handleEnter(
+  arg: string,
+  ctx: any,
+  storage: CronStorage,
+  refresh: (ctx: any) => void
+): Promise<void> {
+  const reports = storage.getRunHistory().filter((r) => r.standalone);
+  if (reports.length === 0) {
+    ctx.ui.notify("No standalone report sessions recorded.", "info");
+    return;
+  }
+  const record = resolveReplayTarget(arg, reports);
+  if (!record) {
+    ctx.ui.notify("No matching report found.", "error");
+    return;
+  }
+  if (!record.sessionFilePath) {
+    ctx.ui.notify(
+      `No session file was captured for "${record.jobName}". Use /schedule-prompt replay ${record.jobId} to read its output instead.`,
+      "error"
+    );
+    return;
+  }
+  if (!fs.existsSync(record.sessionFilePath)) {
+    ctx.ui.notify(
+      `The session file for "${record.jobName}" no longer exists on disk. Use /schedule-prompt replay ${record.jobId} to read the captured output.`,
+      "error"
+    );
+    return;
+  }
+  if (typeof ctx.switchSession !== "function") {
+    ctx.ui.notify("Entering a report session isn't supported in this mode.", "error");
+    return;
+  }
+  // Acknowledge before switching: once switchSession replaces the session this
+  // extension instance is torn down, so do the state write first.
+  storage.acknowledgeRun(record.id);
+  refresh(ctx);
+  const result = await ctx.switchSession(record.sessionFilePath);
+  if (result?.cancelled) {
+    ctx.ui.notify("Entering report session cancelled.", "info");
+  }
+}
+
+async function handleDismiss(
+  arg: string,
+  ctx: any,
+  storage: CronStorage,
+  refresh: (ctx: any) => void
+): Promise<void> {
+  if (!arg || arg === "all") {
+    const n = storage.getUnacknowledgedReports().length;
+    storage.acknowledgeAllReports();
+    refresh(ctx);
+    ctx.ui.notify(n > 0 ? `Dismissed ${n} report${n > 1 ? "s" : ""}.` : "No reports to dismiss.", "info");
+    return;
+  }
+  const reports = storage.getRunHistory().filter((r) => r.standalone);
+  const record = resolveReplayTarget(arg, reports);
+  if (!record) {
+    ctx.ui.notify("No matching report found.", "error");
+    return;
+  }
+  storage.acknowledgeRun(record.id);
+  refresh(ctx);
+  ctx.ui.notify(`Dismissed report: ${record.jobName}.`, "info");
 }
 
 /**
@@ -258,6 +357,40 @@ export default async function (pi: ExtensionAPI) {
   let widget: CronWidget;
   let widgetVisible = true;
   let storageForVisibility: CronStorage | undefined;
+  // The latest interactive session ctx, captured on session_start. Used to drive
+  // the persistent "reports available" footer + widget from background events
+  // (e.g. a standalone run completing) that don't carry their own ctx.
+  let sessionCtx: any;
+
+  /**
+   * Recompute the persistent "reports available" indicator: a footer status
+   * entry (always visible) plus the widget banner. Safe to call with a stale or
+   * absent ctx — the footer write is best-effort.
+   */
+  const refreshReportIndicator = (ctx: any) => {
+    if (!storage) return;
+    const n = storage.getUnacknowledgedReports().length;
+    try {
+      ctx?.ui?.setStatus?.(
+        "schedule-reports",
+        n > 0 ? `📋 ${n} report${n > 1 ? "s" : ""} available` : undefined
+      );
+    } catch {
+      // ui may be unavailable (rpc/print modes) or the ctx may be stale after a
+      // session swap — the indicator is non-critical, so swallow.
+    }
+    // Re-render the widget so the banner appears/updates. show() re-evaluates
+    // visibility (it now stays visible when reports are pending even with no
+    // jobs); only force it when the user hasn't hidden the widget.
+    if (widgetVisible && widget && ctx?.ui) {
+      widget.show(ctx);
+    }
+  };
+
+  // A standalone run completing emits a "cron:change"; refresh the indicator
+  // against the live session ctx. Subscribed once (not per-session) so it
+  // doesn't accumulate across session swaps.
+  pi.events.on("cron:change", () => refreshReportIndicator(sessionCtx));
 
   // Register custom message renderer for scheduled prompts
   pi.registerMessageRenderer("scheduled_prompt", (message, _options, theme) => {
@@ -386,6 +519,7 @@ export default async function (pi: ExtensionAPI) {
 
   const initializeSession = (ctx: any) => {
     // Create storage and scheduler
+    sessionCtx = ctx;
     storage = new CronStorage(ctx.cwd);
     storageForVisibility = storage;
     widgetVisible = storage.getWidgetVisible();
@@ -399,6 +533,10 @@ export default async function (pi: ExtensionAPI) {
     if (widgetVisible) {
       widget.show(ctx);
     }
+
+    // Restore the persistent report indicator from any reports left unread by a
+    // previous session (e.g. completed while the app was closed).
+    refreshReportIndicator(ctx);
   };
 
   const cleanupForSession = (ctx: any, reason: SessionShutdownReason | undefined) => {
@@ -446,6 +584,9 @@ export default async function (pi: ExtensionAPI) {
       "Manage scheduled prompts interactively. Subcommands: " +
       "retry [N|jobId|substring] — re-fire a job (defaults to the most recent run); " +
       "replay [N|jobId|substring] — show output of a past run; " +
+      "reports — list standalone reports awaiting review; " +
+      "enter [N|jobId|substring] — open a standalone report's session for follow-ups; " +
+      "dismiss [N|jobId|substring|all] — clear report(s) from the indicator; " +
       "ps — list dedicated prompts currently running or queued.",
     handler: async (args, ctx) => {
       const trimmed = args?.trim() ?? "";
@@ -456,7 +597,21 @@ export default async function (pi: ExtensionAPI) {
       }
       if (trimmed === "replay" || trimmed.startsWith("replay ")) {
         const subArg = trimmed.slice("replay".length).trim();
-        await handleReplay(subArg, ctx, getStorage());
+        await handleReplay(subArg, ctx, getStorage(), refreshReportIndicator);
+        return;
+      }
+      if (trimmed === "reports") {
+        await handleReports(ctx, getStorage());
+        return;
+      }
+      if (trimmed === "enter" || trimmed.startsWith("enter ")) {
+        const subArg = trimmed.slice("enter".length).trim();
+        await handleEnter(subArg, ctx, getStorage(), refreshReportIndicator);
+        return;
+      }
+      if (trimmed === "dismiss" || trimmed.startsWith("dismiss ")) {
+        const subArg = trimmed.slice("dismiss".length).trim();
+        await handleDismiss(subArg, ctx, getStorage(), refreshReportIndicator);
         return;
       }
       if (trimmed === "ps") {
@@ -467,16 +622,24 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      const action = await ctx.ui.select("Scheduled Prompts", [
+      const hasReports = getStorage().getUnacknowledgedReports().length > 0;
+      const menu = [
         "View All Jobs",
         "Add New Job",
         "Toggle Job (Enable/Disable)",
         "Remove Job",
         "Cleanup Disabled Jobs",
         "Toggle Widget Visibility",
-      ]);
+      ];
+      if (hasReports) menu.splice(1, 0, "View Reports");
+      const action = await ctx.ui.select("Scheduled Prompts", menu);
 
       if (!action) return;
+
+      if (action === "View Reports") {
+        await handleReports(ctx, getStorage());
+        return;
+      }
 
       const actionMap: Record<string, string> = {
         "View All Jobs": "list",

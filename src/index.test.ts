@@ -66,6 +66,7 @@ describe("pickJobsToAutoCleanup", () => {
 
 function makeRun(overrides: Partial<RunRecord> = {}): RunRecord {
   return {
+    id: "r",
     jobId: "j",
     jobName: "Job",
     jobPrompt: "do thing",

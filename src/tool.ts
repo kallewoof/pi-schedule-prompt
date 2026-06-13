@@ -58,9 +58,9 @@ export function createCronTool(
               );
             }
 
-            if (params.command && params.dedicatedContext) {
+            if (params.command && (params.dedicatedContext || params.standalone)) {
               throw new Error(
-                "command=true and dedicatedContext=true are mutually exclusive — use one or the other."
+                "command=true is mutually exclusive with dedicatedContext / standalone — use one or the other."
               );
             }
 
@@ -138,6 +138,7 @@ export function createCronTool(
               description: params.jobDescription,
               guaranteed: params.guaranteed ?? false,
               dedicatedContext: params.dedicatedContext ?? false,
+              standalone: params.standalone ?? false,
               command: params.command ?? false,
               targetContext: (ctx as any)?.context as string | undefined,
             };
@@ -271,14 +272,16 @@ export function createCronTool(
             if (params.jobDescription !== undefined) updates.description = params.jobDescription;
             if (params.guaranteed !== undefined) updates.guaranteed = params.guaranteed;
             if (params.dedicatedContext !== undefined) updates.dedicatedContext = params.dedicatedContext;
+            if (params.standalone !== undefined) updates.standalone = params.standalone;
             if (params.command !== undefined) updates.command = params.command;
             if (params.jobType) updates.type = params.jobType as CronJobType;
 
             const effectiveCommand = updates.command ?? job.command ?? false;
             const effectiveDedicated = updates.dedicatedContext ?? job.dedicatedContext ?? false;
-            if (effectiveCommand && effectiveDedicated) {
+            const effectiveStandalone = updates.standalone ?? job.standalone ?? false;
+            if (effectiveCommand && (effectiveDedicated || effectiveStandalone)) {
               throw new Error(
-                "command=true and dedicatedContext=true are mutually exclusive — use one or the other."
+                "command=true is mutually exclusive with dedicatedContext / standalone — use one or the other."
               );
             }
 
@@ -360,7 +363,7 @@ export function createCronTool(
               const lastStr = job.lastRun ? `Last: ${formatISOLocal(job.lastRun)}` : "Never run";
 
               lines.push(`${status} ${job.name} (${job.id})`);
-              lines.push(`  Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Schedule: ${formatSchedule(job.type, job.schedule)} | Guaranteed: ${job.guaranteed ? "yes" : "no"} | Dedicated: ${job.dedicatedContext ? "yes" : "no"}`);
+              lines.push(`  Type: ${job.type} | Recurring: ${job.type !== "once" ? "yes" : "no"} | Schedule: ${formatSchedule(job.type, job.schedule)} | Guaranteed: ${job.guaranteed ? "yes" : "no"} | Dedicated: ${job.dedicatedContext ? "yes" : "no"} | Standalone: ${job.standalone ? "yes" : "no"}`);
               lines.push(`  ${job.command ? "Command ($): " : "Prompt: "}${job.prompt}`);
               lines.push(`  ${lastStr} ${nextStr ? `| ${nextStr}` : ""}`);
               lines.push(`  Runs: ${job.runCount} | Status: ${job.lastStatus || "pending"}`);
@@ -451,8 +454,9 @@ export function createCronTool(
           const recurringStr = job.type !== "once" ? theme.fg("success", "yes") : theme.fg("dim", "no");
           const guaranteedStr = job.guaranteed ? theme.fg("warning", "⚡ yes") : theme.fg("dim", "no");
           const dedicatedStr = job.dedicatedContext ? theme.fg("accent", "🔒 yes") : theme.fg("dim", "no");
+          const standaloneStr = job.standalone ? theme.fg("accent", "📋 yes") : theme.fg("dim", "no");
           lines.push(
-            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Recurring:")} ${recurringStr} ${theme.fg("dim", "| Schedule:")} ${formatSchedule(job.type, job.schedule)} ${theme.fg("dim", "| Guaranteed:")} ${guaranteedStr} ${theme.fg("dim", "| Dedicated:")} ${dedicatedStr}`
+            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Recurring:")} ${recurringStr} ${theme.fg("dim", "| Schedule:")} ${formatSchedule(job.type, job.schedule)} ${theme.fg("dim", "| Guaranteed:")} ${guaranteedStr} ${theme.fg("dim", "| Dedicated:")} ${dedicatedStr} ${theme.fg("dim", "| Standalone:")} ${standaloneStr}`
           );
           const promptLabel = job.command
             ? theme.fg("accent", "Command ($):")
