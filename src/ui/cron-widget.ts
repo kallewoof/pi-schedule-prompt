@@ -220,7 +220,7 @@ export class CronWidget {
       container.addChild(
         new Text(
           theme.fg("warning", `📋 ${pendingReports} report${pendingReports > 1 ? "s" : ""} available`) +
-            theme.fg("dim", " — /schedule-prompt reports"),
+            theme.fg("dim", " — /schedule-prompt review"),
           1,
           0
         )

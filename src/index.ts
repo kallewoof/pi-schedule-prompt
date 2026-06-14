@@ -420,7 +420,7 @@ export default async function (pi: ExtensionAPI) {
     try {
       ctx?.ui?.setStatus?.(
         "schedule-reports",
-        n > 0 ? `📋 ${n} report${n > 1 ? "s" : ""} available` : undefined
+        n > 0 ? `📋 ${n} report${n > 1 ? "s" : ""} available — /schedule-prompt review` : undefined
       );
     } catch {
       // ui may be unavailable (rpc/print modes) or the ctx may be stale after a
