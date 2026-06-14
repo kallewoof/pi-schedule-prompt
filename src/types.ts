@@ -89,6 +89,8 @@ export interface CronStore {
   widgetVisible?: boolean;
   /** Last 10 run records, newest last */
   runHistory?: RunRecord[];
+  /** Id of the most recently reviewed/replayed standalone report; target for a no-arg `enter`. */
+  lastReplayedReportId?: string;
 }
 
 /**

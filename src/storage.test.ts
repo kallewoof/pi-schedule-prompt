@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { trimRunHistory } from "./storage.js";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import { CronStorage, trimRunHistory } from "./storage.js";
 import type { RunRecord } from "./types.js";
 
 function rec(overrides: Partial<RunRecord> = {}): RunRecord {
@@ -69,5 +72,21 @@ describe("trimRunHistory", () => {
     // Oldest three dropped, newest kept.
     expect(trimmed[0].id).toBe("r3");
     expect(trimmed.at(-1)?.id).toBe("r12");
+  });
+});
+
+describe("CronStorage last-replayed report pointer", () => {
+  it("round-trips through persistence", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sched-store-"));
+    try {
+      const storage = new CronStorage(dir);
+      expect(storage.getLastReplayedReportId()).toBeUndefined();
+      storage.setLastReplayedReportId("rep-1");
+      expect(storage.getLastReplayedReportId()).toBe("rep-1");
+      // A fresh instance reads the persisted value.
+      expect(new CronStorage(dir).getLastReplayedReportId()).toBe("rep-1");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

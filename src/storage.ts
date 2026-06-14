@@ -188,6 +188,16 @@ export class CronStorage {
     this.save(store);
   }
 
+  getLastReplayedReportId(): string | undefined {
+    return this.load().lastReplayedReportId;
+  }
+
+  setLastReplayedReportId(id: string): void {
+    const store = this.load();
+    store.lastReplayedReportId = id;
+    this.save(store);
+  }
+
   getRunHistory(): RunRecord[] {
     return this.load().runHistory ?? [];
   }

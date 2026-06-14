@@ -166,11 +166,50 @@ async function handleReplay(
     return;
   }
   ctx.ui.notify(formatReplayRecord(record), "info");
-  // Viewing a standalone report's output clears it from the pending indicator.
-  if (record.standalone && !record.acknowledged) {
-    storage.acknowledgeRun(record.id);
-    refresh(ctx);
+  // Viewing a standalone report's output clears it from the pending indicator
+  // and primes it as the target for a no-arg `enter`.
+  if (record.standalone) {
+    storage.setLastReplayedReportId(record.id);
+    if (!record.acknowledged) {
+      storage.acknowledgeRun(record.id);
+      refresh(ctx);
+    }
   }
+}
+
+/**
+ * Replay the next unread standalone report (oldest first), mark it read, and
+ * remember it as the target for a no-arg `enter`. Lets the user walk the queue
+ * with repeated `/schedule-prompt review` calls without naming a target.
+ */
+async function handleReview(
+  ctx: any,
+  storage: CronStorage,
+  refresh: (ctx: any) => void
+): Promise<void> {
+  const reports = storage.getUnacknowledgedReports();
+  if (reports.length === 0) {
+    ctx.ui.notify("No reports awaiting review.", "info");
+    return;
+  }
+  const record = reports[0];
+  storage.acknowledgeRun(record.id);
+  storage.setLastReplayedReportId(record.id);
+  refresh(ctx);
+  // Single notification: pi's notify is a single-slot transient, so the report
+  // body and the navigation hint must be combined or the hint clobbers the body.
+  const remaining = reports.length - 1;
+  const enterHint = record.sessionFilePath
+    ? "/schedule-prompt enter to open this report's session"
+    : "";
+  const navLines: string[] = [];
+  if (remaining > 0) {
+    navLines.push(`${remaining} more report${remaining > 1 ? "s" : ""} awaiting review — /schedule-prompt review for the next.`);
+  } else {
+    navLines.push("That was the last report awaiting review.");
+  }
+  if (enterHint) navLines.push(enterHint);
+  ctx.ui.notify(`${formatReplayRecord(record)}\n\n${navLines.join("\n")}`, "info");
 }
 
 /** Format the list of standalone reports awaiting review for `/schedule-prompt reports`. */
@@ -208,7 +247,15 @@ async function handleEnter(
     ctx.ui.notify("No standalone report sessions recorded.", "info");
     return;
   }
-  const record = resolveReplayTarget(arg, reports);
+  let record: RunRecord | null;
+  if (arg) {
+    record = resolveReplayTarget(arg, reports);
+  } else {
+    // No target: prefer the last reviewed/replayed report, falling back to the
+    // most recent one when nothing has been reviewed yet (or it aged out).
+    const lastId = storage.getLastReplayedReportId();
+    record = (lastId && reports.find((r) => r.id === lastId)) || resolveReplayTarget("", reports);
+  }
   if (!record) {
     ctx.ui.notify("No matching report found.", "error");
     return;
@@ -585,7 +632,8 @@ export default async function (pi: ExtensionAPI) {
       "retry [N|jobId|substring] — re-fire a job (defaults to the most recent run); " +
       "replay [N|jobId|substring] — show output of a past run; " +
       "reports — list standalone reports awaiting review; " +
-      "enter [N|jobId|substring] — open a standalone report's session for follow-ups; " +
+      "review — replay the next unread report (repeat to walk the queue); " +
+      "enter [N|jobId|substring] — open a report's session for follow-ups (no arg = last reviewed); " +
       "dismiss [N|jobId|substring|all] — clear report(s) from the indicator; " +
       "ps — list dedicated prompts currently running or queued.",
     handler: async (args, ctx) => {
@@ -602,6 +650,11 @@ export default async function (pi: ExtensionAPI) {
       }
       if (trimmed === "reports") {
         await handleReports(ctx, getStorage());
+        return;
+      }
+      if (trimmed === "review" || trimmed.startsWith("review ")) {
+        // `review` walks the unread queue; any trailing arg is ignored.
+        await handleReview(ctx, getStorage(), refreshReportIndicator);
         return;
       }
       if (trimmed === "enter" || trimmed.startsWith("enter ")) {
@@ -631,11 +684,15 @@ export default async function (pi: ExtensionAPI) {
         "Cleanup Disabled Jobs",
         "Toggle Widget Visibility",
       ];
-      if (hasReports) menu.splice(1, 0, "View Reports");
+      if (hasReports) menu.splice(1, 0, "Review Next Report", "View Reports");
       const action = await ctx.ui.select("Scheduled Prompts", menu);
 
       if (!action) return;
 
+      if (action === "Review Next Report") {
+        await handleReview(ctx, getStorage(), refreshReportIndicator);
+        return;
+      }
       if (action === "View Reports") {
         await handleReports(ctx, getStorage());
         return;
