@@ -130,6 +130,20 @@ export function resolveReplayTarget(
   return null;
 }
 
+/**
+ * Wrap text in the theme's normal foreground color for display via `ctx.ui.notify`.
+ *
+ * `notify(_, "info")` routes to the TUI's `showStatus`, which renders the whole
+ * string with `theme.fg("dim", …)` — fine for one-line status, but it makes
+ * multi-line report bodies blend into the background. Pre-coloring the body with
+ * the high-contrast "text" color overrides that dim wrapper. Falls back to the
+ * raw string when no theme is available (e.g. RPC/JSON modes).
+ */
+function readableNotify(ctx: any, text: string): string {
+  const theme = ctx?.ui?.theme;
+  return theme && typeof theme.fg === "function" ? theme.fg("text", text) : text;
+}
+
 /** Format a RunRecord for display in `/schedule-prompt replay`. */
 export function formatReplayRecord(record: RunRecord): string {
   const start = new Date(record.startTime).toLocaleString();
@@ -165,7 +179,7 @@ async function handleReplay(
     ctx.ui.notify("No matching run found.", "error");
     return;
   }
-  ctx.ui.notify(formatReplayRecord(record), "info");
+  ctx.ui.notify(readableNotify(ctx, formatReplayRecord(record)), "info");
   // Viewing a standalone report's output clears it from the pending indicator
   // and primes it as the target for a no-arg `enter`.
   if (record.standalone) {
@@ -209,7 +223,7 @@ async function handleReview(
     navLines.push("That was the last report awaiting review.");
   }
   if (enterHint) navLines.push(enterHint);
-  ctx.ui.notify(`${formatReplayRecord(record)}\n\n${navLines.join("\n")}`, "info");
+  ctx.ui.notify(readableNotify(ctx, `${formatReplayRecord(record)}\n\n${navLines.join("\n")}`), "info");
 }
 
 /** Format the list of standalone reports awaiting review for `/schedule-prompt reports`. */
@@ -233,7 +247,7 @@ async function handleReports(ctx: any, storage: CronStorage): Promise<void> {
     ctx.ui.notify("No reports awaiting review.", "info");
     return;
   }
-  ctx.ui.notify(formatReportsList(reports), "info");
+  ctx.ui.notify(readableNotify(ctx, formatReportsList(reports)), "info");
 }
 
 async function handleEnter(
