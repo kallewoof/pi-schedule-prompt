@@ -3001,3 +3001,102 @@ describe("notify emits unconditionally (silent-park regression)", () => {
     }
   });
 });
+
+// ---- Authoritative idle-gate recovery (stuck agentRunning/sending mirror) ----
+//
+// In RPC/multi-context mode agent_start/agent_end can be missed, leaving the
+// gate flags stuck "busy" so scheduled fires defer forever and only drain on the
+// next user interaction. When pi authoritatively reports idle (ExtensionAPI.isIdle)
+// past the post-send grace window, the scheduler must treat the mirror as stale
+// and let the fire proceed.
+
+const GRACE_MS = 60 * 1000;
+
+describe("authoritative idle-gate recovery", () => {
+  it("fires a deferred-eligible job when pi reports idle but the mirror is stuck busy", async () => {
+    const job = makeJob({ prompt: "reminder" });
+    const storage = makeMockStorage([job]);
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => true) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    // Simulate a stuck mirror: a prior turn's agent_end was missed.
+    (scheduler as any).agentRunning = true;
+    // lastSendAt defaults to 0, so we're well past the grace window.
+
+    await executeJob(scheduler, job);
+
+    // Gate recovered → the once job fired and was removed (not left deferred).
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(storage.removeJob).toHaveBeenCalledWith(job.id);
+    expect((scheduler as any).deferredActions).toHaveLength(0);
+  });
+
+  it("does NOT recover within the post-send grace window (avoids double-fire)", async () => {
+    const job = makeJob({ prompt: "reminder" });
+    const storage = makeMockStorage([job]);
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => true) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    // A send was just issued; its turn may not have started streaming yet, so a
+    // transient idle report must NOT be treated as a stuck gate.
+    (scheduler as any).sending = true;
+    (scheduler as any).lastSendAt = Date.now();
+
+    await executeJob(scheduler, job);
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect((scheduler as any).deferredActions).toHaveLength(1);
+  });
+
+  it("does NOT recover while pi reports busy", async () => {
+    const job = makeJob({ prompt: "reminder" });
+    const storage = makeMockStorage([job]);
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => false) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    (scheduler as any).agentRunning = true; // mirror busy AND pi genuinely busy
+
+    await executeJob(scheduler, job);
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect((scheduler as any).deferredActions).toHaveLength(1);
+  });
+
+  it("preserves legacy deferral when the runtime lacks isIdle()", async () => {
+    const job = makeJob({ prompt: "reminder" });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi(); // no isIdle — older pi runtime
+    const scheduler = makeScheduler(storage, pi as any);
+
+    (scheduler as any).agentRunning = true;
+
+    await executeJob(scheduler, job);
+
+    // Unknown idle state → fall back to mirror-only behaviour (defer).
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect((scheduler as any).deferredActions).toHaveLength(1);
+  });
+
+  it("watchdog backstop drains a genuinely-deferred job once pi goes idle", async () => {
+    const job = makeJob({ id: "job-deferred", prompt: "later" });
+    const storage = makeMockStorage([job]);
+    // Busy at first, so the fire defers through the normal gate.
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => false) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    (scheduler as any).agentRunning = true;
+    await executeJob(scheduler, job);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect((scheduler as any).deferredActions).toHaveLength(1);
+
+    // pi goes idle, but no agent_end ever advances the deferred queue.
+    pi.isIdle.mockReturnValue(true);
+    (scheduler as any).lastSendAt = Date.now() - GRACE_MS - 1;
+
+    // Watchdog backstop kicks the queue; inner setTimeout(0) needs a non-zero flush.
+    (scheduler as any).recoverDeferredIfIdle();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+});

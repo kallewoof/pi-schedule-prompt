@@ -190,6 +190,15 @@ export class CronScheduler {
   private sendingWatchdog: NodeJS.Timeout | null = null;
   private readonly SENDING_WATCHDOG_MS = 5 * 60 * 1000;
   /**
+   * Epoch ms of the last turn we initiated (main-session send or retry). Used as a
+   * grace window by clearGateIfStale(): a send we just issued sets sending=true
+   * synchronously, but pi's isStreaming only flips true once the turn actually
+   * begins streaming. Within this window pi may still report idle even though the
+   * "busy" flag is legitimate, so we must not mistake it for a stuck gate.
+   */
+  private lastSendAt = 0;
+  private readonly GATE_RECOVERY_GRACE_MS = 60 * 1000;
+  /**
    * Periodic sweep that evicts leaked in-flight subprocess entries so the
    * host-wide subprocess slot can't get permanently stuck. Started in start(),
    * cleared in stop(). See SUBPROCESS_STALE_MS.
@@ -317,7 +326,10 @@ export class CronScheduler {
    */
   private startSubprocessWatchdog(): void {
     if (this.subprocessWatchdog !== null) return;
-    const t = setInterval(() => this.sweepStaleSubprocesses(), SUBPROCESS_SWEEP_MS);
+    const t = setInterval(() => {
+      this.sweepStaleSubprocesses();
+      this.recoverDeferredIfIdle();
+    }, SUBPROCESS_SWEEP_MS);
     if (typeof (t as NodeJS.Timeout).unref === "function") (t as NodeJS.Timeout).unref();
     this.subprocessWatchdog = t;
   }
@@ -938,6 +950,79 @@ export class CronScheduler {
     }
   }
 
+  /**
+   * Read pi's authoritative idle state, if the runtime exposes it.
+   * Returns undefined on older runtimes that lack `isIdle` (or if the call
+   * throws) — callers treat undefined as "unknown" and fall back to the
+   * event-mirrored flags, preserving legacy behaviour.
+   */
+  private piReportsIdle(): boolean | undefined {
+    const fn = (this.pi as { isIdle?: () => boolean }).isIdle;
+    if (typeof fn !== "function") return undefined;
+    try {
+      return fn.call(this.pi);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The agentRunning/sending/retrying flags mirror pi's turn state via
+   * agent_start/agent_end. In RPC/multi-context mode those events can be missed
+   * (aborted/overflow-recovery turns, turns on sibling context sessions),
+   * leaving the mirror stuck "busy" so every scheduled fire defers forever and
+   * only drains one-per-real-agent_end.
+   *
+   * When pi authoritatively reports idle AND we're past the post-send grace
+   * window (so a just-issued send whose turn hasn't begun streaming isn't
+   * mistaken for stuck), treat the mirror as stale and clear it. Returns true if
+   * it cleared a stuck gate.
+   */
+  private clearGateIfStale(): boolean {
+    if (!(this.agentRunning || this.sending || this.retrying)) return false;
+    if (this.piReportsIdle() !== true) return false;
+    if (Date.now() - this.lastSendAt < this.GATE_RECOVERY_GRACE_MS) return false;
+
+    const stuckRetryJobId = this.retrying ? this.retryingJobId : null;
+    this.sending = false;
+    this.agentRunning = false;
+    this.retrying = false;
+    this.retryingJobId = null;
+    this.currentTurnIsScheduled = true;
+    if (this.sendingWatchdog !== null) {
+      clearTimeout(this.sendingWatchdog);
+      this.sendingWatchdog = null;
+    }
+    console.warn(
+      "[scheduler] Cleared stale busy gate (pi reports idle, no agent_end received). " +
+        "Resuming deferred scheduled prompts."
+    );
+    // A retry that was in flight when the gate stuck never received its
+    // agent_end; reschedule it rather than silently dropping it.
+    if (stuckRetryJobId) {
+      const job = this.storage.getJob(stuckRetryJobId);
+      if (job && job.enabled && job.guaranteed) {
+        this.scheduleRetryTimer(stuckRetryJobId);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Watchdog backstop: clear a stale gate if present, then — if the gate is free
+   * and deferred sends are waiting — drain one. Covers jobs that were deferred
+   * while pi was genuinely busy and then went idle without an agent_end to
+   * advance the deferred queue.
+   */
+  private recoverDeferredIfIdle(): void {
+    if (this.stopped) return;
+    const cleared = this.clearGateIfStale();
+    const gateFree = !(this.agentRunning || this.sending || this.retrying);
+    if ((cleared || gateFree) && this.deferredActions.length > 0) {
+      this.processNextDeferred();
+    }
+  }
+
   private async executeJobIfLeader(job: CronJob): Promise<void> {
     if (job.command) {
       // Shell command — runs in a child process, never invokes the agent.
@@ -955,6 +1040,10 @@ export class CronScheduler {
       this.enqueueOrRunSubprocess("dedicated", job);
       return;
     }
+    // Authoritative recovery: if the mirror says "busy" but pi reports idle past
+    // the grace window, the agent_start/end events were missed — clear the stale
+    // flags so this fire proceeds on time instead of deferring forever.
+    this.clearGateIfStale();
     if (this.agentRunning || this.retrying || this.sending) {
       // Block new sends while the agent is active or a send/retry is in-flight.
       if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
@@ -1017,6 +1106,7 @@ export class CronScheduler {
       // Both send calls succeeded — an agent turn is now in flight.
       // sending will be cleared by notifyAgentEnd when the turn completes.
       sendCompleted = true;
+      this.lastSendAt = Date.now();
 
       // Track which job's message is now at the tail of context.
       this.contextTailJobId = job.id;
@@ -1155,6 +1245,7 @@ export class CronScheduler {
     this.retryingJobId = jobId;
     this.currentTurnJobId = jobId;
     this.currentTurnStartTime = new Date().toISOString();
+    this.lastSendAt = Date.now();
 
     if (this.contextTailJobId === jobId) {
       // Context ends with this job's error message — use retryLastTurn for a clean replay.
