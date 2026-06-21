@@ -214,6 +214,17 @@ export class CronStorage {
     return this.getRunHistory().filter((r) => r.standalone && !r.acknowledged);
   }
 
+  /** Repoint a run record's captured session file (e.g. after promotion). Returns false if not found. */
+  setRunRecordSessionPath(id: string, sessionFilePath: string): boolean {
+    const store = this.load();
+    const history = store.runHistory ?? [];
+    const record = history.find((r) => r.id === id);
+    if (!record) return false;
+    record.sessionFilePath = sessionFilePath;
+    this.save({ ...store, runHistory: history });
+    return true;
+  }
+
   /** Mark a single run record acknowledged by its id. Returns false if not found. */
   acknowledgeRun(id: string): boolean {
     const store = this.load();

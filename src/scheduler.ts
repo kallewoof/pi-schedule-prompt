@@ -33,6 +33,45 @@ const SUBPROCESS_STALE_MS = DEDICATED_JOB_TIMEOUT_MS + 2 * 60 * 1000;
 const DEDICATED_SESSION_DIR = path.join(os.homedir(), ".pi", "agent", "schedule-prompt-sessions");
 
 /**
+ * Default per-project session dir that `pi --resume` lists. Mirrors pi-mono's
+ * `getDefaultSessionDirPath()` encoding (session-manager.ts: `--<cwd>--` with
+ * `/`, `\`, `:` collapsed to `-`). `DEDICATED_SESSION_DIR` is a sibling of this
+ * tree's `sessions/` folder, so we derive the resumable dir relative to it —
+ * keeping the same hardcoded `~/.pi/agent` assumption the segregated dir already
+ * makes (i.e. not honoring pi's `PI_CODING_AGENT_DIR` override, by design).
+ */
+export function defaultResumableSessionDir(
+  cwd: string,
+  sessionsRoot: string = path.join(DEDICATED_SESSION_DIR, "..", "sessions")
+): string {
+  const resolved = path.resolve(cwd);
+  const safe = `--${resolved.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+  return path.join(sessionsRoot, safe);
+}
+
+/**
+ * Move a segregated dedicated-session file into the resumable session dir so it
+ * shows up in `pi --resume` and survives run-history eviction. Idempotent:
+ * returns the path to switch to (the already-promoted path when nothing to move).
+ * `sessionsRoot` is injectable for tests; production uses the default.
+ */
+export function promoteSessionToResumable(sessionFilePath: string, cwd: string, sessionsRoot?: string): string {
+  const destDir = defaultResumableSessionDir(cwd, sessionsRoot);
+  const dest = path.join(destDir, path.basename(sessionFilePath));
+  if (path.resolve(sessionFilePath) === path.resolve(dest)) return sessionFilePath; // already promoted
+  if (fs.existsSync(dest)) return dest; // same session id already present at the destination
+  fs.mkdirSync(destDir, { recursive: true });
+  try {
+    fs.renameSync(sessionFilePath, dest);
+  } catch {
+    // Cross-device rename (EXDEV) — fall back to copy + unlink.
+    fs.copyFileSync(sessionFilePath, dest);
+    fs.unlinkSync(sessionFilePath);
+  }
+  return dest;
+}
+
+/**
  * Module-scope tracking of in-flight dedicated subprocesses. Lives across
  * scheduler instances because session replacement (`/new`, `/fork`, `/resume`,
  * `/reload`) discards the old CronScheduler and constructs a new one — but the

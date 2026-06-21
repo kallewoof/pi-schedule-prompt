@@ -1,12 +1,23 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+
+vi.mock("./scheduler.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./scheduler.js")>();
+  return { ...actual, promoteSessionToResumable: vi.fn() };
+});
+
 import {
   cleanupSession,
   formatPsOutput,
   formatReplayRecord,
+  handleEnter,
   pickJobsToAutoCleanup,
   resolveReplayTarget,
   resolveRetryTarget,
 } from "./index.js";
+import { promoteSessionToResumable } from "./scheduler.js";
 import type { CronJob, RunRecord, SessionShutdownReason } from "./types.js";
 
 function makeJob(overrides: Partial<CronJob> = {}): CronJob {
@@ -360,5 +371,76 @@ describe("formatPsOutput", () => {
     );
     expect(out).toContain("Running dedicated prompts");
     expect(out).toContain("Queued retries");
+  });
+});
+
+describe("handleEnter session promotion", () => {
+  let sessionFile: string;
+
+  beforeEach(() => {
+    vi.mocked(promoteSessionToResumable).mockReset();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sched-enter-"));
+    sessionFile = path.join(dir, "20260101T000000_abc.jsonl");
+    fs.writeFileSync(sessionFile, '{"type":"session","id":"abc"}\n');
+  });
+
+  function makeStorage(records: RunRecord[]) {
+    return {
+      getRunHistory: vi.fn(() => records),
+      getLastReplayedReportId: vi.fn(() => undefined),
+      setRunRecordSessionPath: vi.fn(),
+      acknowledgeRun: vi.fn(),
+    } as any;
+  }
+
+  function makeCtx() {
+    return {
+      cwd: "/home/x/proj",
+      ui: { notify: vi.fn() },
+      switchSession: vi.fn(async () => ({ cancelled: false })),
+    };
+  }
+
+  it("promotes the session, repoints the record, and switches to the promoted path with a named session", async () => {
+    const record = makeRun({ id: "r1", standalone: true, sessionFilePath: sessionFile });
+    const storage = makeStorage([record]);
+    const ctx = makeCtx();
+    vi.mocked(promoteSessionToResumable).mockReturnValue("/promoted/run.jsonl");
+
+    await handleEnter("", ctx, storage, () => {});
+
+    expect(promoteSessionToResumable).toHaveBeenCalledWith(sessionFile, "/home/x/proj");
+    expect(storage.setRunRecordSessionPath).toHaveBeenCalledWith("r1", "/promoted/run.jsonl");
+    expect(storage.acknowledgeRun).toHaveBeenCalledWith("r1");
+    expect(ctx.switchSession).toHaveBeenCalledWith(
+      "/promoted/run.jsonl",
+      expect.objectContaining({ withSession: expect.any(Function) })
+    );
+
+    // withSession names the replacement session.
+    const opts = (ctx.switchSession.mock.calls[0] as unknown[])[1] as {
+      withSession: (c: any) => Promise<void>;
+    };
+    const sctx = { setSessionName: vi.fn() };
+    await opts.withSession(sctx);
+    expect(sctx.setSessionName).toHaveBeenCalledWith(expect.stringContaining("Job"));
+  });
+
+  it("falls back to entering in place (and warns) when promotion fails", async () => {
+    const record = makeRun({ id: "r1", standalone: true, sessionFilePath: sessionFile });
+    const storage = makeStorage([record]);
+    const ctx = makeCtx();
+    vi.mocked(promoteSessionToResumable).mockImplementation(() => {
+      throw new Error("disk full");
+    });
+
+    await handleEnter("", ctx, storage, () => {});
+
+    expect(storage.setRunRecordSessionPath).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Couldn't make this session resumable"),
+      "warn"
+    );
+    expect(ctx.switchSession).toHaveBeenCalledWith(sessionFile, expect.anything());
   });
 });

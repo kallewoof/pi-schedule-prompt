@@ -90,3 +90,29 @@ describe("CronStorage last-replayed report pointer", () => {
     }
   });
 });
+
+describe("CronStorage.setRunRecordSessionPath", () => {
+  it("repoints a record's session file and persists it", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sched-store-"));
+    try {
+      const storage = new CronStorage(dir);
+      storage.addRunRecord(rec({ standalone: true, sessionFilePath: "/old/path.jsonl" }));
+      const id = storage.getRunHistory()[0].id;
+      expect(storage.setRunRecordSessionPath(id, "/new/path.jsonl")).toBe(true);
+      expect(storage.getRunHistory()[0].sessionFilePath).toBe("/new/path.jsonl");
+      // Persisted across instances.
+      expect(new CronStorage(dir).getRunHistory()[0].sessionFilePath).toBe("/new/path.jsonl");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns false for an unknown id", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sched-store-"));
+    try {
+      expect(new CronStorage(dir).setRunRecordSessionPath("nope", "/x.jsonl")).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

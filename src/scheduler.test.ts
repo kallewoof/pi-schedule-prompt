@@ -1,9 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import {
   CronScheduler,
+  defaultResumableSessionDir,
   detectFailureHint,
   formatDedicatedRunOutput,
   getDedicatedActivity,
+  promoteSessionToResumable,
   renderMessages,
   __resetSubprocessStateForTests,
 } from "./scheduler.js";
@@ -3186,5 +3191,72 @@ describe("positive idle-gate: defers on authoritative pi busy state (hijack regr
 
     // Unknown idle state (undefined) must not block — preserve legacy behaviour.
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("defaultResumableSessionDir", () => {
+  it("encodes the cwd the way pi --resume expects (slashes/colons → dashes, wrapped in --)", () => {
+    expect(defaultResumableSessionDir("/home/x/proj", "/root/sessions")).toBe(
+      path.join("/root/sessions", "--home-x-proj--")
+    );
+  });
+});
+
+describe("promoteSessionToResumable", () => {
+  it("moves the session file into the resumable dir, preserving the basename", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "sched-promote-"));
+    try {
+      const src = path.join(base, "seg", "20260101T000000_abc123.jsonl");
+      fs.mkdirSync(path.dirname(src), { recursive: true });
+      fs.writeFileSync(src, '{"type":"session","id":"abc123"}\n');
+      const root = path.join(base, "sessions");
+
+      const dest = promoteSessionToResumable(src, "/home/x/proj", root);
+
+      expect(dest).toBe(path.join(root, "--home-x-proj--", "20260101T000000_abc123.jsonl"));
+      expect(fs.existsSync(dest)).toBe(true);
+      expect(fs.existsSync(src)).toBe(false); // moved, not copied
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("is idempotent: re-promoting an already-promoted file returns it unchanged", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "sched-promote-"));
+    try {
+      const root = path.join(base, "sessions");
+      const promoted = path.join(defaultResumableSessionDir("/home/x/proj", root), "run.jsonl");
+      fs.mkdirSync(path.dirname(promoted), { recursive: true });
+      fs.writeFileSync(promoted, "x\n");
+
+      const result = promoteSessionToResumable(promoted, "/home/x/proj", root);
+
+      expect(result).toBe(promoted);
+      expect(fs.existsSync(promoted)).toBe(true);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("returns the existing destination without overwriting when the same id is already there", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "sched-promote-"));
+    try {
+      const root = path.join(base, "sessions");
+      const dest = path.join(defaultResumableSessionDir("/home/x/proj", root), "dup.jsonl");
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, "original\n");
+
+      const src = path.join(base, "seg", "dup.jsonl");
+      fs.mkdirSync(path.dirname(src), { recursive: true });
+      fs.writeFileSync(src, "incoming\n");
+
+      const result = promoteSessionToResumable(src, "/home/x/proj", root);
+
+      expect(result).toBe(dest);
+      expect(fs.readFileSync(dest, "utf8")).toBe("original\n"); // not clobbered
+      expect(fs.existsSync(src)).toBe(true); // left in place
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
 });

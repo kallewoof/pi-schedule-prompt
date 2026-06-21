@@ -15,7 +15,7 @@ import type { CronJob, RunRecord, SessionShutdownReason } from "./types.js";
 import { Key } from "@mariozechner/pi-tui";
 import { Container, Text } from "@mariozechner/pi-tui";
 import { CronStorage } from "./storage.js";
-import { CronScheduler, getDedicatedActivity } from "./scheduler.js";
+import { CronScheduler, getDedicatedActivity, promoteSessionToResumable } from "./scheduler.js";
 import { createCronTool } from "./tool.js";
 import { CronWidget } from "./ui/cron-widget.js";
 import { formatLocalDateTime, formatRelativeHint, formatSchedule, sortJobsByNextRun } from "./utils.js";
@@ -250,7 +250,7 @@ async function handleReports(ctx: any, storage: CronStorage): Promise<void> {
   ctx.ui.notify(readableNotify(ctx, formatReportsList(reports)), "info");
 }
 
-async function handleEnter(
+export async function handleEnter(
   arg: string,
   ctx: any,
   storage: CronStorage,
@@ -292,11 +292,29 @@ async function handleEnter(
     ctx.ui.notify("Entering a report session isn't supported in this mode.", "error");
     return;
   }
+  // Promote the dedicated session into the resumable dir so `pi --resume` lists
+  // it and it survives a crash or run-history eviction. Best-effort: on failure
+  // fall back to entering the segregated file in place.
+  let enterPath = record.sessionFilePath;
+  try {
+    enterPath = promoteSessionToResumable(record.sessionFilePath, ctx.cwd ?? process.cwd());
+    storage.setRunRecordSessionPath(record.id, enterPath);
+  } catch (e) {
+    ctx.ui.notify(
+      `Couldn't make this session resumable: ${(e as Error).message}. Entering in place.`,
+      "warn"
+    );
+  }
   // Acknowledge before switching: once switchSession replaces the session this
   // extension instance is torn down, so do the state write first.
   storage.acknowledgeRun(record.id);
   refresh(ctx);
-  const result = await ctx.switchSession(record.sessionFilePath);
+  const name = `${record.jobName} (${formatLocalDateTime(new Date(record.startTime))})`;
+  const result = await ctx.switchSession(enterPath, {
+    withSession: async (sctx: any) => {
+      sctx.setSessionName(name);
+    },
+  });
   if (result?.cancelled) {
     ctx.ui.notify("Entering report session cancelled.", "info");
   }
