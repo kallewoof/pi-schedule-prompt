@@ -1044,7 +1044,16 @@ export class CronScheduler {
     // the grace window, the agent_start/end events were missed — clear the stale
     // flags so this fire proceeds on time instead of deferring forever.
     this.clearGateIfStale();
-    if (this.agentRunning || this.retrying || this.sending) {
+    // Defer if our event-mirrored flags say busy, OR if pi authoritatively reports
+    // it is streaming. The mirror flags (agentRunning/sending/retrying) can diverge
+    // from pi's real isStreaming — agent_end is suppressed on overflow recovery,
+    // events are missed in RPC/multi-context turns, or arrive out of order — and
+    // when the mirror reads "idle" mid-task the send lands as a steering message
+    // that hijacks the user's turn (or is silently dropped by the fire-and-forget
+    // ExtensionAPI wrapper). pi.isIdle() (=!isStreaming) is the authoritative signal
+    // and stays true for the whole multi-tool task. piReportsIdle() returns
+    // undefined on runtimes without isIdle, so legacy behaviour is preserved.
+    if (this.agentRunning || this.retrying || this.sending || this.piReportsIdle() === false) {
       // Block new sends while the agent is active or a send/retry is in-flight.
       if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
         this.deferredActions.push({ type: "send", job });
@@ -1065,9 +1074,11 @@ export class CronScheduler {
   }
 
   private async executeJob(job: CronJob): Promise<void> {
-    // Final guard after leadership wait: if agent started while we waited, defer
-    // instead of racing against isStreaming and producing an error.
-    if (this.agentRunning) {
+    // Final guard after leadership wait: if the agent started (or pi reports it is
+    // streaming) while we waited, defer instead of racing against isStreaming and
+    // producing an error. The piReportsIdle() re-check here closes the window
+    // between the gate check in executeJobIfLeader and this actual send.
+    if (this.agentRunning || this.piReportsIdle() === false) {
       this.sending = false;
       if (!this.deferredActions.some((a) => a.type === "send" && a.job.id === job.id)) {
         this.deferredActions.unshift({ type: "send", job });

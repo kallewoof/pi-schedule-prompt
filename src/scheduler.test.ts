@@ -3100,3 +3100,91 @@ describe("authoritative idle-gate recovery", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 });
+
+// ---- Positive idle-gate: defer when pi reports busy even if mirror flags are clear ----
+//
+// The hijack regression: a scheduled prompt fired while the user was working got
+// sent because the gate only consulted agentRunning/sending/retrying. Those mirror
+// flags can diverge from pi's real isStreaming (agent_end suppressed on overflow
+// recovery, events missed in RPC/multi-context turns). pi.isIdle() (=!isStreaming)
+// is authoritative and stays true for the whole multi-tool task, so the gate must
+// defer on isIdle()===false regardless of the mirror.
+describe("positive idle-gate: defers on authoritative pi busy state (hijack regression)", () => {
+  it("defers when pi reports busy even though all mirror flags are clear", async () => {
+    const job = makeJob({ prompt: "scheduled reminder" });
+    const storage = makeMockStorage([job]);
+    // pi is streaming a user turn, but the mirror never saw agent_start.
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => false) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    // agentRunning/sending/retrying all default false — the pre-fix gate would send.
+    await executeJob(scheduler, job);
+
+    // BUG (pre-fix): sendUserMessage hijacks the user's in-flight turn.
+    // EXPECTED: deferred, not sent.
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect((scheduler as any).deferredActions).toHaveLength(1);
+  });
+
+  it("fires immediately when pi reports idle and mirror flags are clear", async () => {
+    const job = makeJob({ prompt: "scheduled reminder" });
+    const storage = makeMockStorage([job]);
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => true) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    await executeJob(scheduler, job);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect((scheduler as any).deferredActions).toHaveLength(0);
+  });
+
+  it("drains the deferred prompt as its own turn once pi goes idle", async () => {
+    const job = makeJob({ id: "job-wait", prompt: "later reminder" });
+    const storage = makeMockStorage([job]);
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => false) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    // Fires mid-task → deferred on authoritative busy.
+    await executeJob(scheduler, job);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect((scheduler as any).deferredActions).toHaveLength(1);
+
+    // The user's turn ends: pi goes idle, then agent_end drains the queue.
+    pi.isIdle.mockReturnValue(true);
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect((scheduler as any).deferredActions).toHaveLength(0);
+  });
+
+  it("a drain attempt while pi is still busy re-defers instead of sending", async () => {
+    const job = makeJob({ id: "job-busy", prompt: "later reminder" });
+    const storage = makeMockStorage([job]);
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => false) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    await executeJob(scheduler, job);
+    expect((scheduler as any).deferredActions).toHaveLength(1);
+
+    // A spurious agent_end arrives while pi is genuinely still streaming.
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The re-entered gate re-checks isIdle() → still busy → re-deferred, not sent.
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect((scheduler as any).deferredActions).toHaveLength(1);
+  });
+
+  it("legacy runtime without isIdle() keeps mirror-only behaviour (fires when flags clear)", async () => {
+    const job = makeJob({ prompt: "scheduled reminder" });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi(); // no isIdle — older pi runtime
+    const scheduler = makeScheduler(storage, pi as any);
+
+    await executeJob(scheduler, job);
+
+    // Unknown idle state (undefined) must not block — preserve legacy behaviour.
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+});
