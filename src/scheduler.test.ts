@@ -3260,3 +3260,61 @@ describe("promoteSessionToResumable", () => {
     }
   });
 });
+
+// ---- leaked-scheduler regression ----
+//
+// pi fires session_start (reason "reload"/"new"/"fork"/"resume") on every
+// session swap — routine in multi-context RPC mode — and index.ts builds a
+// fresh CronScheduler + calls start() each time. Before the fix nothing stopped
+// the previous instance, so its Cron timers kept firing and every scheduled job
+// ran once per leaked instance — the user saw the same scheduled message
+// delivered twice (or more). start() must tear the prior instance down.
+describe("start() stops the previous scheduler instance (no per-leak double-fire)", () => {
+  function makeRecurringJob(overrides: Partial<CronJob> = {}): CronJob {
+    return {
+      id: "leak-1",
+      name: "Every Second",
+      schedule: "* * * * * *", // every second
+      prompt: "tick",
+      enabled: true,
+      type: "cron",
+      runCount: 0,
+      createdAt: new Date(Date.now() - 60_000).toISOString(),
+      lastRun: new Date().toISOString(), // so start() doesn't treat it as missed
+      lastStatus: "success",
+      guaranteed: false,
+      ...overrides,
+    };
+  }
+
+  it("tears down the prior instance's cron timers when a new instance starts", async () => {
+    const storageA = makeMockStorage([makeRecurringJob()]);
+    const piA = makeMockPi();
+    const schedulerA = makeScheduler(storageA, piA);
+    schedulerA.start();
+
+    // A armed a live cron timer for the job.
+    expect((schedulerA as any).jobs.has("leak-1")).toBe(true);
+    expect((schedulerA as any).stopped).toBe(false);
+
+    // A session swap builds a fresh scheduler (new pi ctx) over the same store.
+    const storageB = makeMockStorage([makeRecurringJob()]);
+    const piB = makeMockPi();
+    const schedulerB = makeScheduler(storageB, piB);
+    schedulerB.start();
+
+    // Starting B must have stopped A: its cron timers are cleared and it's
+    // marked stopped, while B owns the live timer.
+    expect((schedulerA as any).stopped).toBe(true);
+    expect((schedulerA as any).jobs.size).toBe(0);
+    expect((schedulerB as any).jobs.has("leak-1")).toBe(true);
+
+    // Behaviourally: advancing past several ticks fires only the live instance.
+    // Without the fix, A's leaked timer would also fire and piA would be called.
+    await vi.advanceTimersByTimeAsync(3100);
+    expect(piB.sendUserMessage).toHaveBeenCalled();
+    expect(piA.sendUserMessage).not.toHaveBeenCalled();
+
+    schedulerB.stop();
+  });
+});

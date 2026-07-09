@@ -277,6 +277,17 @@ export class CronScheduler {
 
   start(): void {
     this.stopped = false;
+    // A prior scheduler instance can still be alive with live cron timers: pi
+    // fires session_start (reason "reload"/"new"/"fork"/"resume") on every
+    // session swap — routine in multi-context RPC mode — and index.ts builds a
+    // fresh CronScheduler each time. Nothing else stops the old one, so without
+    // this its Cron timers keep firing and every job runs once per leaked
+    // instance (observed as the same scheduled message delivered N times).
+    // Tear the previous instance down before taking over. Pass a non-"quit"
+    // reason so in-flight dedicated subprocesses survive the swap.
+    if (activeScheduler && activeScheduler !== this) {
+      activeScheduler.stop({ reason: "reload" });
+    }
     activeScheduler = this;
     const allJobs = this.storage.getAllJobs();
     const now = new Date();
