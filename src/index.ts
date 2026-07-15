@@ -656,6 +656,17 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
+  // agent_settled fires once the session is fully idle (no continuation, compaction,
+  // or retry pending) — unlike agent_end, which fires per-turn while the run is still
+  // active. On runtimes that emit it, this is what advances the scheduler (confirm the
+  // job, clear the busy gate, drain the next deferred send). Older runtimes never emit
+  // it and drive everything from agent_end instead (see CronScheduler.notifyAgentEnd).
+  pi.on("agent_settled", async (_event) => {
+    if (scheduler) {
+      scheduler.notifyAgentSettled();
+    }
+  });
+
   // --- Register /schedule-prompt command ---
 
   pi.registerCommand("schedule-prompt", {

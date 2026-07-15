@@ -7,7 +7,7 @@ import type { CronJob, CronChangeEvent, RunRecord, SessionShutdownReason } from 
 import type { CronStorage } from "./storage.js";
 
 const GUARANTEED_RETRY_DELAY_MS = 10 * 60 * 1000;
-const DEDICATED_JOB_TIMEOUT_MS = 20 * 60 * 1000;
+const DEDICATED_JOB_TIMEOUT_MS = 60 * 60 * 1000;
 const DEDICATED_JOB_TIMEOUT_MIN = DEDICATED_JOB_TIMEOUT_MS / 60_000;
 
 /**
@@ -250,6 +250,15 @@ export class CronScheduler {
   /** When the current turn's job was fired (ISO timestamp). */
   private currentTurnStartTime: string | null = null;
   /**
+   * Messages from the most recent agent_end. On modern runtimes (that emit
+   * agent_settled), agent_end fires per-turn while the session is still active
+   * across continuations/compaction/retry — so we only record here and let
+   * notifyAgentSettled() consume these once the session is authoritatively idle.
+   * Reset at agent_start so a settle without a fresh agent_end can't mis-capture
+   * a prior run's transcript.
+   */
+  private lastTurnMessages: readonly unknown[] = [];
+  /**
    * Pending setTimeout(0) handles from processNextDeferred. We defer dequeues to
    * the next macrotask so they run AFTER pi's finishRun() clears isStreaming —
    * see processNextDeferred() for details. Tracked so stop() can cancel them.
@@ -463,6 +472,7 @@ export class CronScheduler {
     this.contextTailJobId = null;
     this.currentTurnJobId = null;
     this.currentTurnStartTime = null;
+    this.lastTurnMessages = [];
 
     if (fullTeardown) {
       // Host process is exiting — abort every in-flight dedicated subprocess
@@ -549,6 +559,10 @@ export class CronScheduler {
    */
   notifyAgentStart(): void {
     this.agentRunning = true;
+    // Fresh turn — drop any transcript recorded for a previous turn so a settle
+    // that arrives without a corresponding agent_end can't confirm/capture using
+    // stale messages.
+    this.lastTurnMessages = [];
     // If we sent a message and it hasn't been confirmed yet, this turn belongs to us.
     this.currentTurnIsScheduled = this.sending;
     // The turn has started — no longer need the watchdog to rescue a stuck send.
@@ -559,11 +573,52 @@ export class CronScheduler {
   }
 
   /**
-   * Called by the host when an agent turn ends.
-   * Resolves the current retry or the oldest pending guaranteed once-job,
-   * but only when the turn was scheduler-initiated.
+   * Called by the host when an agent turn ends (agent_end event).
+   *
+   * agent_end fires once *per turn*, but pi keeps the session's run active across
+   * the whole multi-turn loop (continuations, compaction, overflow recovery,
+   * retries) and only reports idle at agent_settled. Advancing the scheduler here
+   * would clear the gate and drain the next scheduled send while the session is
+   * still streaming a continuation.
+   *
+   * So on modern runtimes (that expose isIdle and therefore also emit
+   * agent_settled) we only *record* the turn's messages and let
+   * notifyAgentSettled() advance the scheduler once the session is authoritatively
+   * idle. On legacy runtimes without isIdle/agent_settled we fall back to the
+   * original agent_end-driven behaviour, unchanged.
    */
   notifyAgentEnd(messages: readonly unknown[]): void {
+    this.lastTurnMessages = messages;
+    // Modern runtime: defer confirmation/drain to agent_settled. piReportsIdle()
+    // returns a boolean only when the runtime exposes isIdle; undefined marks the
+    // legacy generation that predates both isIdle and agent_settled.
+    if (this.piReportsIdle() !== undefined) {
+      return;
+    }
+    this.processTurnEnd(messages);
+  }
+
+  /**
+   * Called by the host when an agent run has fully settled (agent_settled event):
+   * no automatic retry, compaction, or queued continuation remains and
+   * pi.isIdle() is authoritatively true. This is the correct point to confirm the
+   * scheduled turn, clear the gate, and drain the next deferred send. Only wired
+   * up / emitted on modern runtimes; legacy runtimes drive everything from
+   * notifyAgentEnd instead.
+   */
+  notifyAgentSettled(): void {
+    const messages = this.lastTurnMessages;
+    this.lastTurnMessages = [];
+    this.processTurnEnd(messages);
+  }
+
+  /**
+   * Resolve the current retry or the oldest pending guaranteed once-job (only
+   * when the turn was scheduler-initiated), capture output, clear the gate, and
+   * drain the next deferred action. Shared by the legacy agent_end path and the
+   * modern agent_settled path.
+   */
+  private processTurnEnd(messages: readonly unknown[]): void {
     this.agentRunning = false;
     // Capture and reset the turn-ownership flag. Reset to true so that a subsequent
     // agent_end without a preceding notifyAgentStart (when agent_start is not wired up)
@@ -1114,6 +1169,13 @@ export class CronScheduler {
     // other executeJobIfLeader calls queued in the same event-loop turn (e.g.
     // multiple missed jobs firing at startup) see sending=true and defer.
     this.sending = true;
+    // Anchor the gate-recovery grace window at claim time, BEFORE awaiting
+    // leadership. Otherwise, on a runtime that reports idle, a second job firing
+    // during the acquireLeadership() await runs clearGateIfStale(), sees isIdle
+    // with a stale (0) lastSendAt past the grace window, and wrongly clears this
+    // just-claimed gate — so both jobs send and collide. executeJob refreshes this
+    // once the send actually goes out.
+    this.lastSendAt = Date.now();
     const isLeader = await this.acquireLeadership();
     if (!isLeader) {
       this.sending = false;
@@ -1157,15 +1219,23 @@ export class CronScheduler {
         typeof piAny.sendMessageToContext === "function" &&
         typeof piAny.sendUserMessageToContext === "function";
 
+      // deliverAs "followUp" is a safety net for the residual race the gate can't
+      // fully close: pi's own prompt() re-checks isStreaming between our
+      // isIdle()-based gate and the point it starts the turn (a TOCTOU window), and
+      // agent_start/end can be missed in RPC/multi-context mode. When pi finds
+      // itself streaming at that check, "followUp" makes it QUEUE the prompt and run
+      // it once the current turn winds down — instead of throwing the fire-and-forget
+      // "Agent is already processing" error and silently dropping the message. When
+      // pi is idle (the normal case) deliverAs is ignored and this starts a fresh turn.
       if (useContext) {
         piAny.sendMessageToContext(job.targetContext, displayMessage);
-        piAny.sendUserMessageToContext(job.targetContext, wrappedPrompt);
+        piAny.sendUserMessageToContext(job.targetContext, wrappedPrompt, { deliverAs: "followUp" });
       } else {
         this.pi.sendMessage(displayMessage);
-        this.pi.sendUserMessage(wrappedPrompt);
+        this.pi.sendUserMessage(wrappedPrompt, { deliverAs: "followUp" });
       }
-      // Both send calls succeeded — an agent turn is now in flight.
-      // sending will be cleared by notifyAgentEnd when the turn completes.
+      // Both send calls succeeded — an agent turn is now in flight (or queued as a
+      // follow-up). sending will be cleared by notifyAgentSettled/notifyAgentEnd.
       sendCompleted = true;
       this.lastSendAt = Date.now();
 
@@ -1270,7 +1340,12 @@ export class CronScheduler {
     }
     const retry = setTimeout(() => {
       this.retries.delete(jobId);
-      if (this.agentRunning || this.retrying || this.sending) {
+      // Defer if the event-mirror flags say busy OR pi authoritatively reports it
+      // is streaming. Matching the send-path gate (executeJobIfLeader): the mirror
+      // flags can be stale-clear when agent_start/end are missed in
+      // RPC/multi-context mode, so without the piReportsIdle() check a retry would
+      // fire retryLastTurn()/sendUserMessage() into a busy agent.
+      if (this.agentRunning || this.retrying || this.sending || this.piReportsIdle() === false) {
         const current = this.storage.getJob(jobId);
         if (current && current.enabled && current.guaranteed) {
           if (!this.deferredActions.some((a) => a.type === "retry" && a.jobId === jobId)) {
@@ -1299,6 +1374,18 @@ export class CronScheduler {
     }
     if (current.dedicatedContext) {
       this.enqueueOrRunSubprocess("dedicated", current);
+      return;
+    }
+
+    // Final gate before a main-session retry: if the agent is active (mirror flags)
+    // or pi authoritatively reports it is streaming, re-defer rather than firing
+    // retryLastTurn()/sendUserMessage() into a busy agent. Closes the window
+    // between the drain decision and this actual send. (Subprocess retries above
+    // are host-serialized separately and intentionally bypass this.)
+    if (this.agentRunning || this.sending || this.retrying || this.piReportsIdle() === false) {
+      if (!this.deferredActions.some((a) => a.type === "retry" && a.jobId === jobId)) {
+        this.deferredActions.push({ type: "retry", jobId });
+      }
       return;
     }
 
@@ -1331,7 +1418,8 @@ export class CronScheduler {
           details: { jobId: current.id, jobName: current.name, prompt: current.prompt },
         });
         this.pi.sendUserMessage(
-          `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n${current.prompt}`
+          `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n${current.prompt}`,
+          { deliverAs: "followUp" }
         );
         this.contextTailJobId = jobId;
       } catch (error) {

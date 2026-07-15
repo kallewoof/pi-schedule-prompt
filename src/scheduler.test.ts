@@ -515,19 +515,19 @@ describe("sending flag serialises concurrent sends at startup", () => {
     // Only the first job should have been sent; B and C are deferred.
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
     const prefix = `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n`;
-    expect(pi.sendUserMessage).toHaveBeenCalledWith(`${prefix}task A`);
+    expect(pi.sendUserMessage).toHaveBeenCalledWith(`${prefix}task A`, { deliverAs: "followUp" });
 
-    // agent_end for A → B fires
+    // agent_end for A → B fires (legacy pi mock has no isIdle → agent_end drives the drain)
     scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
     await vi.advanceTimersByTimeAsync(0);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendUserMessage).toHaveBeenLastCalledWith(`${prefix}task B`);
+    expect(pi.sendUserMessage).toHaveBeenLastCalledWith(`${prefix}task B`, { deliverAs: "followUp" });
 
     // agent_end for B → C fires
     scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
     await vi.advanceTimersByTimeAsync(0);
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
-    expect(pi.sendUserMessage).toHaveBeenLastCalledWith(`${prefix}task C`);
+    expect(pi.sendUserMessage).toHaveBeenLastCalledWith(`${prefix}task C`, { deliverAs: "followUp" });
   });
 
   it("defers a job that fires while a non-guaranteed send is in-flight", async () => {
@@ -1095,7 +1095,8 @@ describe("context-aware routing", () => {
 
     expect(pi.sendUserMessageToContext).toHaveBeenCalledWith(
       "+alice",
-      expect.stringContaining(job.prompt)
+      expect.stringContaining(job.prompt),
+      { deliverAs: "followUp" }
     );
     expect(pi.sendMessageToContext).toHaveBeenCalledWith(
       "+alice",
@@ -1405,7 +1406,7 @@ describe("runJobNow (public API for /schedule-prompt retry)", () => {
     await scheduler.runJobNow(job.id);
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("p"));
+    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("p"), { deliverAs: "followUp" });
   });
 
   it("fires a dedicated job through executeDedicatedJob", async () => {
@@ -2853,8 +2854,9 @@ describe("subprocess slot recovery (stuck-slot regression)", () => {
     expect(pi.exec).toHaveBeenCalledTimes(1);
 
     // Past the threshold (exec timeout + grace), the sweep evicts A and the slot
-    // is recoverable: B finally dispatches.
-    await vi.advanceTimersByTimeAsync(20 * 60 * 1000 + 3 * 60 * 1000);
+    // is recoverable: B finally dispatches. Threshold tracks DEDICATED_JOB_TIMEOUT_MS
+    // (60m) + SUBPROCESS grace (2m), so advance past 62m.
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000 + 3 * 60 * 1000);
     scheduler.sweepStaleSubprocesses();
     for (let i = 0; i < 20; i++) await Promise.resolve();
 
@@ -3154,9 +3156,11 @@ describe("positive idle-gate: defers on authoritative pi busy state (hijack regr
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
     expect((scheduler as any).deferredActions).toHaveLength(1);
 
-    // The user's turn ends: pi goes idle, then agent_end drains the queue.
+    // The user's turn fully settles: pi goes idle. On a modern runtime (isIdle
+    // present) agent_end is record-only and agent_settled is what drains the queue.
     pi.isIdle.mockReturnValue(true);
     scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    scheduler.notifyAgentSettled();
     await vi.advanceTimersByTimeAsync(0);
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
@@ -3172,8 +3176,9 @@ describe("positive idle-gate: defers on authoritative pi busy state (hijack regr
     await executeJob(scheduler, job);
     expect((scheduler as any).deferredActions).toHaveLength(1);
 
-    // A spurious agent_end arrives while pi is genuinely still streaming.
+    // A spurious settle arrives while pi is genuinely still streaming (isIdle=false).
     scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop" }]);
+    scheduler.notifyAgentSettled();
     await vi.advanceTimersByTimeAsync(0);
 
     // The re-entered gate re-checks isIdle() → still busy → re-deferred, not sent.
@@ -3191,6 +3196,105 @@ describe("positive idle-gate: defers on authoritative pi busy state (hijack regr
 
     // Unknown idle state (undefined) must not block — preserve legacy behaviour.
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---- agent_settled drives confirmation/drain on modern runtimes ----
+//
+// pi keeps the session's run active across the whole multi-turn loop
+// (continuations, compaction, overflow recovery, retries) and only reports idle at
+// agent_settled — agent_end fires per-turn while the run is still active. Draining
+// the next scheduled send on agent_end would collide with a still-streaming
+// continuation and surface "Agent is already processing". On a runtime that exposes
+// isIdle (and therefore emits agent_settled), the scheduler must treat agent_end as
+// record-only and advance only on agent_settled.
+describe("agent_settled gates confirmation/drain on modern runtimes", () => {
+  it("does NOT confirm a guaranteed once-job on agent_end; confirms on agent_settled", async () => {
+    const job = makeJob({ id: "job-g", guaranteed: true });
+    const storage = makeMockStorage([job]);
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => true) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    await executeJob(scheduler, job);
+    expect(storage.updateJob).toHaveBeenCalledWith(job.id, { lastStatus: "sent" });
+
+    const successMessages = [
+      { role: "user", content: "do the thing", timestamp: 1 },
+      { role: "assistant", content: [], stopReason: "stop", timestamp: 2 },
+    ];
+
+    // agent_end alone: session still active across possible continuations → no confirm.
+    scheduler.notifyAgentEnd(successMessages);
+    expect(storage.removeJob).not.toHaveBeenCalled();
+
+    // agent_settled: session truly idle → confirm (once-job removed from storage).
+    scheduler.notifyAgentSettled();
+    expect(storage.removeJob).toHaveBeenCalledWith(job.id);
+  });
+
+  it("serialises a startup backlog: second job drains only after agent_settled, not agent_end", async () => {
+    const jobA = makeJob({ id: "job-a", guaranteed: true, prompt: "task A" });
+    const jobB = makeJob({ id: "job-b", name: "Job B", guaranteed: true, prompt: "task B" });
+    const storage = makeMockStorage([jobA, jobB]);
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => true) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    // Two missed guaranteed jobs fire concurrently, as start() does.
+    const p1 = (scheduler as any).executeJobIfLeader(jobA);
+    const p2 = (scheduler as any).executeJobIfLeader(jobB);
+    await Promise.all([p1, p2]);
+
+    // A sent, B deferred (A's synchronous sending=true gate holds B back).
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect((scheduler as any).deferredActions).toHaveLength(1);
+
+    // A per-turn agent_end (e.g. a compaction turn inside A's run) must NOT drain B —
+    // the session is still active. isIdle stays true here, so the only thing holding
+    // B back is that agent_end is record-only on modern runtimes.
+    scheduler.notifyAgentEnd([{ role: "assistant", stopReason: "stop", timestamp: 1 }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // A settles → B drains as its own turn.
+    scheduler.notifyAgentSettled();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    const prefix = `This is an automated scheduled prompt. Interpret and execute the following directly — phrases like "remind me" mean perform the action now, not schedule another reminder:\n\n`;
+    expect(pi.sendUserMessage).toHaveBeenLastCalledWith(`${prefix}task B`, { deliverAs: "followUp" });
+  });
+
+});
+
+// ---- retry path honours the authoritative idle gate ----
+describe("guaranteed retry defers while pi reports busy", () => {
+  it("scheduleRetryTimer defers instead of firing when isIdle()===false", async () => {
+    const job = makeJob({ id: "job-r", guaranteed: true });
+    const storage = makeMockStorage([job]);
+    // Mirror flags are all clear, but pi authoritatively reports streaming.
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => false) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    (scheduler as any).scheduleRetryTimer(job.id);
+    await vi.advanceTimersByTimeAsync(RETRY_MS);
+
+    // Busy → deferred as a retry action, neither retryLastTurn nor sendUserMessage fired.
+    expect(pi.retryLastTurn).not.toHaveBeenCalled();
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect((scheduler as any).deferredActions).toContainEqual({ type: "retry", jobId: job.id });
+  });
+
+  it("triggerRetry re-defers when pi goes busy between the timer and the send", async () => {
+    const job = makeJob({ id: "job-r2", guaranteed: true });
+    const storage = makeMockStorage([job]);
+    const pi = { ...makeMockPi(), isIdle: vi.fn(() => false) };
+    const scheduler = makeScheduler(storage, pi as any);
+
+    (scheduler as any).triggerRetry(job.id);
+
+    expect(pi.retryLastTurn).not.toHaveBeenCalled();
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect((scheduler as any).retrying).toBe(false);
+    expect((scheduler as any).deferredActions).toContainEqual({ type: "retry", jobId: job.id });
   });
 });
 
