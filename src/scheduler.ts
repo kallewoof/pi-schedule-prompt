@@ -11,6 +11,16 @@ const DEDICATED_JOB_TIMEOUT_MS = 60 * 60 * 1000;
 const DEDICATED_JOB_TIMEOUT_MIN = DEDICATED_JOB_TIMEOUT_MS / 60_000;
 
 /**
+ * How long a job may legitimately sit at `lastStatus === "running"` before a
+ * startup recovery pass treats it as a crashed run. Sized just past the longest
+ * a real run can live: a dedicated/command subprocess is killed at
+ * `DEDICATED_JOB_TIMEOUT_MS` (plus watchdog slack), and a main-session send
+ * transitions out of "running" far sooner. Used only as a pid-recycling backstop
+ * in `recoverStaleRunningJobs` — the primary signal is `runnerPid` liveness.
+ */
+const STALE_RUNNING_MS = DEDICATED_JOB_TIMEOUT_MS + 5 * 60 * 1000;
+
+/**
  * Stale-slot watchdog: how often to sweep the host-wide subprocess slot, and
  * how old an in-flight entry may get before it's treated as leaked and evicted.
  *
@@ -298,8 +308,12 @@ export class CronScheduler {
       activeScheduler.stop({ reason: "reload" });
     }
     activeScheduler = this;
-    const allJobs = this.storage.getAllJobs();
     const now = new Date();
+    // Recover jobs frozen at lastStatus="running" by a crashed/killed run BEFORE
+    // taking the job snapshot — storage has no in-memory cache, so reads after this
+    // reflect the resets and the loop below sees the recovered "error" status.
+    this.recoverStaleRunningJobs(now);
+    const allJobs = this.storage.getAllJobs();
 
     for (const job of allJobs) {
       if (!job.enabled) continue;
@@ -377,6 +391,46 @@ export class CronScheduler {
     this.drainSubprocessQueue();
 
     this.startSubprocessWatchdog();
+  }
+
+  /**
+   * Recover jobs frozen at `lastStatus === "running"`.
+   *
+   * A run sets `"running"` synchronously and only writes a terminal status once
+   * it settles. If the owning process dies first — host crash, kill, or the
+   * AbortError paths in `executeDedicatedJob`/`executeCommandJob` that return
+   * without touching storage — the job is left stuck at `"running"` forever.
+   * `start()` deliberately refuses to re-fire a `"running"` job (grandchild
+   * fork-bomb protection), so without this pass it never auto-recovers.
+   *
+   * The catch: a `"running"` job may be genuinely owned by a *live* process —
+   * e.g. the parent pi that spawned this instance via `pi --mode json -p` for a
+   * dedicated job. Resetting that would re-fire and resurrect the fork-bomb. The
+   * global `leader.pid` can't disambiguate (it's a single value, and dedicated/
+   * command jobs never write it), so we rely on the per-job `runnerPid` recorded
+   * at the `"running"` transition: only reset when no live process owns the run.
+   */
+  private recoverStaleRunningJobs(now: Date): void {
+    for (const job of this.storage.getAllJobs()) {
+      if (job.lastStatus !== "running") continue;
+      // Genuinely running in THIS process (a subprocess that survived a session
+      // swap) — the module-scope in-flight maps are the authoritative signal.
+      if (inFlightDedicated.has(job.id) || inFlightCommand.has(job.id)) continue;
+      // A recorded owner that is still alive AND a run that started within the
+      // max run window means the run is genuinely in progress elsewhere (e.g. the
+      // live parent pi that spawned us). runStartedAt (not lastRun, which records
+      // the last *completed* run) is the true run-start; the window is a
+      // pid-recycling backstop, since no real run outlives it.
+      const startedMs = job.runStartedAt ? new Date(job.runStartedAt).getTime() : 0;
+      const recent = now.getTime() - startedMs < STALE_RUNNING_MS;
+      if (job.runnerPid != null && recent && this.isPidAlive(job.runnerPid)) continue;
+      // Otherwise: no owner recorded (pre-existing stuck jobs), owner dead, or
+      // overdue past any legitimate run → the run failed. Reset to "error" so
+      // start()'s guaranteed-retry / missed-catch-up handling takes over.
+      this.storage.updateJob(job.id, { lastStatus: "error" });
+      const recovered = this.storage.getJob(job.id);
+      if (recovered) this.emitChange({ type: "update", job: recovered });
+    }
   }
 
   /**
@@ -1202,7 +1256,7 @@ export class CronScheduler {
 
     let sendCompleted = false;
     try {
-      this.storage.updateJob(job.id, { lastStatus: "running" });
+      this.storage.updateJob(job.id, { lastStatus: "running", runnerPid: process.pid, runStartedAt: new Date().toISOString() });
       this.emitChange({ type: "fire", job });
 
       const displayMessage = {
@@ -1521,7 +1575,7 @@ export class CronScheduler {
       { jobId: job.id, jobName: job.name, prompt: job.prompt, startTime: startTime }
     );
 
-    this.storage.updateJob(job.id, { lastStatus: "running" });
+    this.storage.updateJob(job.id, { lastStatus: "running", runnerPid: process.pid, runStartedAt: startTime });
     this.emitChange({ type: "fire", job });
 
     const wrappedPrompt =
@@ -1719,7 +1773,7 @@ export class CronScheduler {
     // No begin notification for command jobs — they're typically short and
     // the running state is already visible in the widget (status: running)
     // and /schedule-prompt ps. A separate begin message just adds noise.
-    this.storage.updateJob(job.id, { lastStatus: "running" });
+    this.storage.updateJob(job.id, { lastStatus: "running", runnerPid: process.pid, runStartedAt: startTime });
     this.emitChange({ type: "fire", job });
 
     let status: "success" | "error" = "success";

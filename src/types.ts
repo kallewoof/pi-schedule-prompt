@@ -36,6 +36,10 @@ export interface CronJob {
   lastRun?: string;
   /** Status of last execution */
   lastStatus?: CronJobStatus;
+  /** OS pid of the process that set lastStatus="running". Used on startup to detect a run whose owning process died mid-execution (crashed run) so it can be recovered. Only meaningful while lastStatus === "running". */
+  runnerPid?: number;
+  /** ISO timestamp of when the current run entered lastStatus="running" (distinct from lastRun, which records the last *completed* run). Backstops the runnerPid liveness check against pid recycling. Only meaningful while lastStatus === "running". */
+  runStartedAt?: string;
   /** Next scheduled run (computed) */
   nextRun?: string;
   /** Number of times executed */

@@ -1864,6 +1864,11 @@ describe("start(): does not recursively spawn when a dedicated job is already ru
       createdAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
       lastRun: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
       guaranteed: true,
+      // A LIVE owner (this test process) with a fresh run-start represents the
+      // parent pi that set "running" and is still executing the job — stale-running
+      // recovery must leave it alone so start()'s fork-bomb guard still applies.
+      runnerPid: process.pid,
+      runStartedAt: new Date().toISOString(),
       ...overrides,
     };
   }
@@ -1913,6 +1918,9 @@ describe("start(): does not recursively spawn when a dedicated job is already ru
       guaranteed: true,
       lastRun: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
       lastStatus: "running",
+      // Live owner + fresh run-start = a parent pi still executing this run.
+      runnerPid: process.pid,
+      runStartedAt: new Date().toISOString(),
       runCount: 1,
     });
     const storage = makeMockStorage([job]);
@@ -1924,6 +1932,123 @@ describe("start(): does not recursively spawn when a dedicated job is already ru
     await Promise.resolve();
 
     expect(pi.exec).not.toHaveBeenCalled();
+  });
+});
+
+// ---- stale-"running" recovery on startup (crashed/killed runs) ----
+//
+// A run sets lastStatus="running" and only writes a terminal status once it
+// settles. If the owning process dies first (host crash, kill, AbortError paths
+// that return without touching storage), the job is frozen at "running" forever
+// — and start() deliberately refuses to re-fire "running" jobs (fork-bomb
+// guard), so it never auto-recovers. recoverStaleRunningJobs() resets such jobs
+// to "error" IFF no live process owns the run, using the per-job runnerPid +
+// runStartedAt recorded at the "running" transition. A LIVE, recent owner (the
+// parent pi still executing a dedicated job) must be left untouched.
+describe("start(): recovers stale 'running' jobs whose owner died", () => {
+  // Any pid the OS reports as non-existent. On Linux pids stay well below 2**22,
+  // so 2**30 is reliably dead; guard by confirming ESRCH just in case.
+  function findDeadPid(): number {
+    for (let pid = 2 ** 30; pid > 2 ** 20; pid--) {
+      try {
+        process.kill(pid, 0);
+      } catch (e: any) {
+        if (e.code === "ESRCH") return pid;
+      }
+    }
+    return 2 ** 30;
+  }
+
+  function makeRunningCron(overrides: Partial<CronJob> = {}): CronJob {
+    return {
+      id: "stuck",
+      name: "Daily Routine",
+      schedule: "0 30 22 * * *",
+      prompt: "do daily things",
+      enabled: true,
+      type: "cron",
+      runCount: 5,
+      createdAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
+      lastRun: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      guaranteed: true,
+      lastStatus: "running",
+      dedicatedContext: true,
+      ...overrides,
+    };
+  }
+
+  it("resets a legacy stuck job (no runnerPid/runStartedAt) to 'error'", async () => {
+    // The real-world case: 7 jobs frozen at "running" from before this field existed.
+    const job = makeRunningCron();
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(storage._store.get("stuck")?.lastStatus).toBe("error");
+    // Guaranteed → routed through the retry timer, not an immediate re-fire.
+    expect(pi.exec).not.toHaveBeenCalled();
+  });
+
+  it("resets a job whose runnerPid is dead", async () => {
+    const job = makeRunningCron({ runnerPid: findDeadPid(), runStartedAt: new Date().toISOString() });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(storage._store.get("stuck")?.lastStatus).toBe("error");
+  });
+
+  it("resets a job whose runStartedAt predates the max run window even if runnerPid is alive (pid-recycling backstop)", async () => {
+    const job = makeRunningCron({
+      runnerPid: process.pid, // alive, but the run started too long ago to be real
+      runStartedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(storage._store.get("stuck")?.lastStatus).toBe("error");
+  });
+
+  it("does NOT reset a job with a live owner and a fresh run-start (parent still executing)", async () => {
+    const job = makeRunningCron({ runnerPid: process.pid, runStartedAt: new Date().toISOString() });
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(storage._store.get("stuck")?.lastStatus).toBe("running");
+    expect(pi.exec).not.toHaveBeenCalled();
+  });
+
+  it("catches up a non-guaranteed recurring job once recovered (handled as if it did not run)", async () => {
+    const job = makeRunningCron({ guaranteed: false }); // legacy stuck, non-guaranteed
+    const storage = makeMockStorage([job]);
+    const pi = makeMockPi();
+    const scheduler = makeScheduler(storage, pi);
+
+    scheduler.start();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Reset to "error" (see below), then start()'s missed-recurring path fires
+    // the catch-up run — the dedicated subprocess is spawned.
+    expect(pi.exec).toHaveBeenCalledTimes(1);
   });
 });
 
